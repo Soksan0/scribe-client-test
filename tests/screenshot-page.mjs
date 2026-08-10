@@ -1,0 +1,11 @@
+const playwrightModule = await import(process.env.SCRIBE_PLAYWRIGHT_MODULE || "playwright");
+const playwright = playwrightModule.chromium ? playwrightModule : playwrightModule.default;
+const browser = await playwright.chromium.launch({ headless: true, executablePath: process.env.SCRIBE_CHROME_PATH || undefined });
+const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
+const errors = [];
+page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+page.on("pageerror", (error) => errors.push(error.message));
+await page.goto(process.env.SCRIBE_PAGE_URL || "http://localhost:3001", { waitUntil: "networkidle" });
+await page.screenshot({ path: process.env.SCRIBE_SCREENSHOT_PATH || "/private/tmp/scribe-page.png", fullPage: true });
+console.log(JSON.stringify({ title: await page.title(), url: page.url(), errors }, null, 2));
+await browser.close();

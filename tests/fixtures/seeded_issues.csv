@@ -1,0 +1,6 @@
+participant_id,status,occupation,age,consent,consent_date
+P001,Active,Teacher  ,30,yes,2026-01-10
+P002,active,Nurse,forty,no,
+P002,active,Nurse,forty,no,
+P004,Inactive,Researcher,nan,yes,not-a-date
+P005,Active,Analyst,121,yes,2026-02-02
