@@ -45,6 +45,20 @@ The key is never stored in the browser, SQLite, exports, or source code. Each Ge
 
 Requirements: Python 3.11 or newer, Node.js 22.13 or newer, and npm.
 
+### Windows quick start for testers
+
+If you are testing Scribe on Windows, read `WINDOWS_CLIENT_GUIDE.md` first.
+
+The shortest path is:
+
+1. Install Python 3.11+ from <https://www.python.org/downloads/>.
+2. Install Node.js 22+ from <https://nodejs.org/>.
+3. Download or clone this repository.
+4. Double-click `Start-Scribe-Windows.bat`.
+5. Open the local address printed by the starter, usually `http://localhost:3000`.
+
+Scribe runs on your own computer. Uploaded datasets stay local in `.scribe_data/`, which is ignored by Git.
+
 ### macOS
 
 ```bash

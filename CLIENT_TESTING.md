@@ -11,6 +11,15 @@ Scribe is a local research-data cleaning app. For testing, run it on your own co
 
 ## Start Scribe
 
+Windows easiest option:
+
+1. Install Python 3.11+ and Node.js 22+.
+2. Download or clone the repo.
+3. Double-click `Start-Scribe-Windows.bat`.
+4. Open `http://localhost:3000`, or the local address printed in the terminal.
+
+For more detail, see `WINDOWS_CLIENT_GUIDE.md`.
+
 macOS or Linux:
 
 ```bash
