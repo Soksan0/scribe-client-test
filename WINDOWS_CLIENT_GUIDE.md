@@ -88,7 +88,7 @@ Please try this with a sample or copied dataset first:
 4. Try accepting a safe correction.
 5. Try rejecting, deferring, or marking a finding as a false positive.
 6. Export the reviewed/cleaned package.
-7. If R is installed, try a verified clean export.
+7. Try a provisional review package. For a verified clean export, complete the R setup below first.
 8. Try Settings, Trash, Restore, and permanent delete on a test project only.
 
 ## 7. Privacy notes
@@ -98,7 +98,23 @@ Please try this with a sample or copied dataset first:
 - Scribe stores local projects in `.scribe_data` inside the project folder by default.
 - `.scribe_data`, `.env`, `.venv`, and `node_modules` are intentionally ignored by Git.
 
-## 8. If something goes wrong
+## 8. Enable verified clean exports (optional)
+
+Scribe can always produce a clearly labelled provisional review package. A verified clean export additionally requires R to independently reproduce and compare the result.
+
+1. Install R for Windows from https://cran.r-project.org/bin/windows/base/.
+2. Open the R application once and run:
+
+```r
+install.packages(c("readr", "dplyr", "openxlsx", "haven"))
+```
+
+3. Close and restart Scribe.
+4. Open Exports. Scribe will show either **R verification is ready** or the exact missing package.
+
+If your organization does not permit installing R, use the provisional review package. Do not describe that package as verified clean.
+
+## 9. If something goes wrong
 
 Please send:
 
@@ -107,3 +123,5 @@ Please send:
 - what file type you uploaded, such as CSV or XLSX;
 - what you expected to happen;
 - what actually happened.
+
+For an upload that says “Failed to fetch,” first confirm the Scribe starter window is still open. Restart `Start-Scribe-Windows.bat`, use the exact local address it prints, and try a small copied CSV. Invalid formats are rejected before upload; supported formats are CSV, TSV, XLSX, SAV, DTA, and RDS (not TXT or XLS).

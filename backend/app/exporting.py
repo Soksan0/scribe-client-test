@@ -22,6 +22,7 @@ OPERATION_PRIORITY = {
     "parse_type": 40,
     "derive_arithmetic": 45,
     "replace": 50,
+    "exclude_column": 90,
     "delete_rows": 100,
 }
 
@@ -109,6 +110,11 @@ def append_r_operations(lines: list[str], operations: list[dict[str, Any]], csv_
         if operation.get("type") == "delete_rows":
             delete_rows.update(operation_row_ordinals(operation))
             continue
+        if operation.get("type") == "exclude_column":
+            step += 1
+            column = json.dumps(operation["column"])
+            lines.extend(["", f"# Step {step}: explicitly approved exclusion of column {operation['column']}", f"stopifnot({column} %in% names(data))", f"data <- data[, setdiff(names(data), {column}), drop = FALSE]"])
+            continue
         if operation.get("type") in {"derive_mapping", "derive_arithmetic"}:
             step += 1
             column = json.dumps(operation["column"])
@@ -130,22 +136,51 @@ def append_r_operations(lines: list[str], operations: list[dict[str, Any]], csv_
         rows = ", ".join(str(row) for row in operation_row_ordinals(operation)) or "integer(0)"
         before = json.dumps(str(operation.get("before", "")))
         after = json.dumps(str(operation.get("after", ""))) if operation.get("type") == "parse_type" else r_literal(operation.get("after"))
-        lines.extend(["", f"# Step {step}: accepted {operation['type']} correction on exact source rows", f"target_rows <- c({rows})", f"matching_rows <- target_rows[as.character(data[[{column}]][target_rows]) == {before}]", f"data[[{column}]][matching_rows] <- {after}"])
+        lines.extend([
+            "",
+            f"# Step {step}: accepted {operation['type']} correction on exact source rows",
+            f"target_rows <- c({rows})",
+            f"matching_rows <- target_rows[as.character(data[[{column}]][target_rows]) == {before}]",
+            "stopifnot(length(matching_rows) == length(target_rows))",
+            f"data[[{column}]][matching_rows] <- {after}",
+        ])
         if operation.get("type") == "parse_type":
             parse_columns[operation["column"]] = operation.get("expected", "number")
     for column_name, expected in parse_columns.items():
         column = json.dumps(column_name)
         converter = ("readr::parse_integer" if expected == "integer" else "readr::parse_number") if csv_reader else ("as.integer" if expected == "integer" else "as.numeric")
-        lines.extend(["", f"# Convert {column_name} after all reviewed token replacements", f"data[[{column}]] <- {converter}(as.character(data[[{column}]]))"])
+        if csv_reader:
+            lines.extend([
+                "",
+                f"# Convert {column_name} after all reviewed token replacements",
+                f"parsed_values <- {converter}(as.character(data[[{column}]]), na = character())",
+                "stopifnot(nrow(readr::problems(parsed_values)) == 0)",
+                f"data[[{column}]] <- parsed_values",
+            ])
+        else:
+            lines.extend(["", f"# Convert {column_name} after all reviewed token replacements", f"data[[{column}]] <- {converter}(as.character(data[[{column}]]))"])
     if delete_rows:
         rows = ", ".join(str(row) for row in sorted(delete_rows))
         lines.extend(["", "# Remove explicitly approved duplicate rows after cell corrections", f"data <- data[-c({rows}), , drop = FALSE]"])
 
 
-def apply_operations(source: Path, destination: Path, operations: list[dict[str, Any]]) -> dict[str, Any]:
+def apply_operations(source: Path, destination: Path, operations: list[dict[str, Any]], parsing_context: dict[str, Any] | None = None) -> dict[str, Any]:
     content = source.read_bytes()
-    text, encoding, _ = decode_bytes(content)
-    delimiter = detect_delimiter(text, source.name)
+    context = parsing_context or {}
+    requested_encoding = context.get("encoding")
+    if requested_encoding:
+        text, encoding = content.decode(str(requested_encoding)), str(requested_encoding)
+    else:
+        text, encoding, _ = decode_bytes(content)
+    delimiter = str(context.get("delimiter") or detect_delimiter(text, source.name))
+    header_row = int(context.get("header_row") or 1)
+    if header_row > 1:
+        raw_rows = list(csv.reader(io.StringIO(text), delimiter=delimiter, strict=True))
+        if header_row > len(raw_rows):
+            raise ValueError(f"Header row {header_row} is outside the source file")
+        staged = io.StringIO()
+        csv.writer(staged, delimiter=delimiter, lineterminator="\n").writerows(raw_rows[header_row - 1 :])
+        text = staged.getvalue()
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
     headers = reader.fieldnames or []
     rows = list(reader)
@@ -153,6 +188,14 @@ def apply_operations(source: Path, destination: Path, operations: list[dict[str,
     for operation in ordered_operations(operations):
         if operation.get("type") == "delete_rows":
             delete_rows.update(operation_row_ordinals(operation))
+            continue
+        if operation.get("type") == "exclude_column":
+            column = operation["column"]
+            if column not in headers:
+                raise ValueError(f"Excluded column {column!r} no longer exists")
+            headers.remove(column)
+            for row in rows:
+                row.pop(column, None)
             continue
         if operation.get("type") in {"derive_mapping", "derive_arithmetic"}:
             column = operation["column"]
@@ -185,16 +228,39 @@ def apply_operations(source: Path, destination: Path, operations: list[dict[str,
     return {"path": str(destination), "sha256": hashlib.sha256(output).hexdigest(), "size_bytes": len(output)}
 
 
-def generate_r_script(source_name: str, output_name: str, operations: list[dict[str, Any]], delimiter: str) -> str:
-    reader = "readr::read_tsv" if delimiter == "\t" else "readr::read_csv"
-    writer = "readr::write_tsv" if delimiter == "\t" else "readr::write_csv"
-    lines = ["# Generated by Scribe. Review before running.", "# Every transformation corresponds to an accepted audit decision.", "library(readr)", "library(dplyr)", "", f'data <- {reader}("originals/{source_name}", show_col_types = FALSE)']
+def generate_r_script(
+    source_name: str,
+    output_name: str,
+    operations: list[dict[str, Any]],
+    delimiter: str,
+    parsing_context: dict[str, Any] | None = None,
+) -> str:
+    context = parsing_context or {}
+    encoding = json.dumps(context.get("encoding") or "UTF-8")
+    delimiter_literal = json.dumps(delimiter)
+    source_literal = json.dumps(f"originals/{source_name}")
+    output_literal = json.dumps(f"cleaned/{output_name}")
+    expected_columns = [str(item.get("name")) for item in context.get("columns", []) if item.get("name") is not None]
+    header_row = int((context.get("parsing_config") or {}).get("header_row") or 1)
+    expected_columns_r = ", ".join(json.dumps(value) for value in expected_columns)
+    lines = [
+        "# Generated by Scribe. Review before running.",
+        "# Every transformation corresponds to an accepted audit decision.",
+        "library(readr)",
+        "library(dplyr)",
+        "",
+        "# Import every source column as text so identifiers and exact preconditions are preserved.",
+        f"data <- readr::read_delim({source_literal}, delim = {delimiter_literal}, skip = {header_row - 1}, col_types = readr::cols(.default = readr::col_character()), locale = readr::locale(encoding = {encoding}), na = character(), trim_ws = FALSE, name_repair = \"minimal\", skip_empty_rows = FALSE, show_col_types = FALSE, progress = FALSE)",
+        "stopifnot(nrow(readr::problems(data)) == 0)",
+    ]
+    if expected_columns:
+        lines.append(f"stopifnot(identical(names(data), c({expected_columns_r})))")
     append_r_operations(lines, operations, csv_reader=True)
-    lines.extend(["", f'{writer}(data, "cleaned/{output_name}", na = "")', ""])
+    lines.extend(["", f"readr::write_delim(data, {output_literal}, delim = {delimiter_literal}, na = \"\")", ""])
     return "\n".join(lines)
 
 
-def apply_xlsx_operations(source: Path, destination: Path, operations: list[dict[str, Any]], sheet_name: str) -> dict[str, Any]:
+def apply_xlsx_operations(source: Path, destination: Path, operations: list[dict[str, Any]], sheet_name: str, header_row: int = 1) -> dict[str, Any]:
     from openpyxl import load_workbook
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -202,11 +268,18 @@ def apply_xlsx_operations(source: Path, destination: Path, operations: list[dict
     shutil.copy2(source, temporary)
     workbook = load_workbook(temporary)
     sheet = workbook[sheet_name]
-    headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value is not None}
+    headers = {str(cell.value): cell.column for cell in sheet[header_row] if cell.value is not None}
     delete_rows: set[int] = set()
     for operation in ordered_operations(operations):
         if operation.get("type") == "delete_rows":
             delete_rows.update(operation_row_ordinals(operation))
+            continue
+        if operation.get("type") == "exclude_column":
+            column = operation["column"]
+            if column not in headers:
+                raise ValueError(f"Excluded column {column!r} no longer exists in worksheet {sheet_name!r}")
+            sheet.delete_cols(headers[column])
+            headers = {str(cell.value): cell.column for cell in sheet[header_row] if cell.value is not None}
             continue
         if operation.get("type") in {"derive_mapping", "derive_arithmetic"}:
             column = operation["column"]
@@ -214,9 +287,9 @@ def apply_xlsx_operations(source: Path, destination: Path, operations: list[dict
                 raise ValueError(f"Column {column!r} no longer exists in worksheet {sheet_name!r}")
             for change in operation.get("changes", []):
                 row_number = change_row_ordinal(change)
-                row_values = {name: sheet.cell(row=row_number + 1, column=position).value for name, position in headers.items()}
+                row_values = {name: sheet.cell(row=row_number + header_row, column=position).value for name, position in headers.items()}
                 apply_derived_change(row_values, operation, change)
-                sheet.cell(row=row_number + 1, column=headers[column]).value = row_values[column]
+                sheet.cell(row=row_number + header_row, column=headers[column]).value = row_values[column]
             continue
         if operation.get("type") not in {"trim", "replace", "map_category", "normalize_missing", "parse_type", "parse_date"}:
             continue
@@ -224,7 +297,7 @@ def apply_xlsx_operations(source: Path, destination: Path, operations: list[dict
         if column not in headers:
             raise ValueError(f"Column {column!r} no longer exists in worksheet {sheet_name!r}")
         for row_number in operation_row_ordinals(operation):
-            cell = sheet.cell(row=row_number + 1, column=headers[column])
+            cell = sheet.cell(row=row_number + header_row, column=headers[column])
             if cell.data_type == "f":
                 raise ValueError(f"Scribe will not replace a formula at row {row_number}, column {column}")
             current = cell.value
@@ -237,7 +310,7 @@ def apply_xlsx_operations(source: Path, destination: Path, operations: list[dict
                 )
             cell.value = operation["after"]
     for row_number in sorted(delete_rows, reverse=True):
-        sheet.delete_rows(row_number + 1)
+        sheet.delete_rows(row_number + header_row)
     workbook.save(temporary)
     temporary.replace(destination)
     output = destination.read_bytes()
@@ -262,6 +335,12 @@ def apply_statistical_operations(source: Path, destination: Path, operations: li
     for operation in ordered_operations(operations):
         if operation.get("type") == "delete_rows":
             delete_rows.update(operation_row_ordinals(operation))
+            continue
+        if operation.get("type") == "exclude_column":
+            column = operation["column"]
+            if column not in frame.columns:
+                raise ValueError(f"Excluded column {column!r} no longer exists")
+            frame = frame.drop(columns=[column])
             continue
         if operation.get("type") in {"derive_mapping", "derive_arithmetic"}:
             column = operation["column"]
@@ -295,9 +374,13 @@ def apply_statistical_operations(source: Path, destination: Path, operations: li
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f"{destination.stem}.partial{destination.suffix}")
     if file_format == "sav":
-        pyreadstat.write_sav(frame, temporary, column_labels=dict(zip(metadata.column_names, metadata.column_labels)), variable_value_labels=metadata.variable_value_labels)
+        labels = {name: label for name, label in zip(metadata.column_names, metadata.column_labels, strict=True) if name in frame.columns}
+        value_labels = {name: labels for name, labels in metadata.variable_value_labels.items() if name in frame.columns}
+        pyreadstat.write_sav(frame, temporary, column_labels=labels, variable_value_labels=value_labels)
     elif file_format == "dta":
-        pyreadstat.write_dta(frame, temporary, column_labels=dict(zip(metadata.column_names, metadata.column_labels)), variable_value_labels=metadata.variable_value_labels)
+        labels = {name: label for name, label in zip(metadata.column_names, metadata.column_labels, strict=True) if name in frame.columns}
+        value_labels = {name: labels for name, labels in metadata.variable_value_labels.items() if name in frame.columns}
+        pyreadstat.write_dta(frame, temporary, column_labels=labels, variable_value_labels=value_labels)
     else:
         pyreadr.write_rds(temporary, frame)
     temporary.replace(destination)
@@ -305,14 +388,15 @@ def apply_statistical_operations(source: Path, destination: Path, operations: li
     return {"path": str(destination), "sha256": hashlib.sha256(output).hexdigest(), "size_bytes": len(output)}
 
 
-def generate_format_r_script(source_name: str, output_name: str, operations: list[dict[str, Any]], file_format: str, delimiter: str | None = None, sheet_name: str | None = None) -> str:
+def generate_format_r_script(source_name: str, output_name: str, operations: list[dict[str, Any]], file_format: str, delimiter: str | None = None, sheet_name: str | None = None, parsing_context: dict[str, Any] | None = None) -> str:
     if file_format in {"csv", "tsv"}:
-        return generate_r_script(source_name, output_name, operations, delimiter or ("\t" if file_format == "tsv" else ","))
+        return generate_r_script(source_name, output_name, operations, delimiter or ("\t" if file_format == "tsv" else ","), parsing_context)
     if file_format == "xlsx":
         libraries = ["library(openxlsx)", "library(dplyr)"]
         sheet = json.dumps(sheet_name or 1)
-        read_line = f'workbook <- openxlsx::loadWorkbook("originals/{source_name}")\ndata <- openxlsx::read.xlsx(workbook, sheet = {sheet})'
-        write_line = f'openxlsx::writeData(workbook, sheet = {sheet}, x = data)\nopenxlsx::saveWorkbook(workbook, "cleaned/{output_name}", overwrite = TRUE)'
+        header_row = int(((parsing_context or {}).get("parsing_config") or {}).get("header_row") or 1)
+        read_line = f'workbook <- openxlsx::loadWorkbook("originals/{source_name}")\ndata <- openxlsx::read.xlsx(workbook, sheet = {sheet}, startRow = {header_row}, check.names = FALSE, skipEmptyRows = FALSE, skipEmptyCols = FALSE)\noriginal_data_rows <- nrow(data)\noriginal_data_columns <- ncol(data)'
+        write_line = f'openxlsx::deleteData(workbook, sheet = {sheet}, cols = seq_len(original_data_columns), rows = {header_row}:({header_row} + original_data_rows))\nopenxlsx::writeData(workbook, sheet = {sheet}, startRow = {header_row}, x = data)\nopenxlsx::saveWorkbook(workbook, "cleaned/{output_name}", overwrite = TRUE)'
     elif file_format in {"sav", "dta"}:
         libraries = ["library(haven)", "library(dplyr)"]
         read_line = f'data <- haven::read_{file_format}("originals/{source_name}")'

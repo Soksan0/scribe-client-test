@@ -9,6 +9,7 @@ dependencies = [
   "pydantic>=2.10,<3",
   "certifi>=2025.1",
   "polars>=1.20,<2",
+  "pandas>=2.2,<4",
   "openpyxl>=3.1,<4",
   "pyreadstat>=1.2,<2",
   "pyreadr>=0.5,<1",

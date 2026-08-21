@@ -21,6 +21,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/r-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** R Status */
+        get: operations["r_status_api_system_r_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/assistant/status": {
         parameters: {
             query?: never;
@@ -246,6 +263,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{project_id}/files/{file_id}/parsing-config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Parsing Config */
+        get: operations["get_parsing_config_api_projects__project_id__files__file_id__parsing_config_get"];
+        /** Update Parsing Config */
+        put: operations["update_parsing_config_api_projects__project_id__files__file_id__parsing_config_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{project_id}/study-config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Study Config */
+        get: operations["get_study_config_api_projects__project_id__study_config_get"];
+        /** Update Study Config */
+        put: operations["update_study_config_api_projects__project_id__study_config_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{project_id}/files/{file_id}/preview": {
         parameters: {
             query?: never;
@@ -430,6 +483,26 @@ export interface paths {
         put?: never;
         /** Disposition Finding */
         post: operations["disposition_finding_api_projects__project_id__findings__finding_id__disposition_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{project_id}/manual-operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Manual Operation
+         * @description Record one evidence-backed edit or exclusion through the normal audited plan.
+         */
+        post: operations["create_manual_operation_api_projects__project_id__manual_operations_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -625,6 +698,52 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
+        /** ManualOperationCreate */
+        ManualOperationCreate: {
+            /** File Id */
+            file_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "cell_correction" | "exclude_row" | "exclude_column";
+            /** Source Finding Id */
+            source_finding_id?: string | null;
+            /** Row Id */
+            row_id?: string | null;
+            /** Column */
+            column?: string | null;
+            /** Before */
+            before?: unknown | null;
+            /** After */
+            after?: unknown | null;
+            /** Rationale */
+            rationale: string;
+            /** Evidence */
+            evidence: string;
+        };
+        /** ParsingConfigUpdate */
+        ParsingConfigUpdate: {
+            /**
+             * Header Row
+             * @default 1
+             */
+            header_row: number;
+            /** Delimiter */
+            delimiter?: ("," | "\t" | ";" | "|") | null;
+            /** Encoding */
+            encoding?: string | null;
+            /** Date Locale */
+            date_locale?: ("day_first" | "month_first" | "year_first") | null;
+            /** Missing Tokens */
+            missing_tokens?: string[];
+            /** Identifier Columns */
+            identifier_columns?: string[];
+            /** Variable Labels */
+            variable_labels?: {
+                [key: string]: string;
+            };
+        };
         /** ProjectCreate */
         ProjectCreate: {
             /** Name */
@@ -692,6 +811,44 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** StudyConfigUpdate */
+        StudyConfigUpdate: {
+            /** Participant Keys */
+            participant_keys?: string[];
+            /**
+             * Allowed Repeats
+             * @default false
+             */
+            allowed_repeats: boolean;
+            /** Item Groups */
+            item_groups?: {
+                [key: string]: unknown;
+            }[];
+            /** Timestamp Columns */
+            timestamp_columns?: {
+                [key: string]: string;
+            };
+            /** Completion */
+            completion?: {
+                [key: string]: unknown;
+            };
+            /** Attention Checks */
+            attention_checks?: {
+                [key: string]: unknown;
+            }[];
+            /** Skip Rules */
+            skip_rules?: {
+                [key: string]: unknown;
+            }[];
+            /** Missing Codes */
+            missing_codes?: {
+                [key: string]: unknown[];
+            };
+            /** Cross Field Rules */
+            cross_field_rules?: {
+                [key: string]: unknown;
+            }[];
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -731,6 +888,28 @@ export interface operations {
                 content: {
                     "application/json": {
                         [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    r_status_api_system_r_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
                     };
                 };
             };
@@ -1297,6 +1476,148 @@ export interface operations {
             };
         };
     };
+    get_parsing_config_api_projects__project_id__files__file_id__parsing_config_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                file_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_parsing_config_api_projects__project_id__files__file_id__parsing_config_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                file_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ParsingConfigUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_study_config_api_projects__project_id__study_config_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_study_config_api_projects__project_id__study_config_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StudyConfigUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     preview_file_api_projects__project_id__files__file_id__preview_get: {
         parameters: {
             query?: {
@@ -1770,6 +2091,43 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_manual_operation_api_projects__project_id__manual_operations_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManualOperationCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };

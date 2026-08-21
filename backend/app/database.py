@@ -146,6 +146,16 @@ def ensure_storage() -> None:
                 status TEXT NOT NULL, engine_version TEXT NOT NULL,
                 rationale TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS parsing_configs (
+                file_id TEXT PRIMARY KEY REFERENCES files(id), project_id TEXT NOT NULL REFERENCES projects(id),
+                version INTEGER NOT NULL, status TEXT NOT NULL, config_json TEXT NOT NULL,
+                config_hash TEXT NOT NULL, canonical_path TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS study_configs (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id), version INTEGER NOT NULL,
+                status TEXT NOT NULL, config_json TEXT NOT NULL, config_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS findings_project_status_idx ON findings(project_id, status, severity);
             CREATE INDEX IF NOT EXISTS files_project_idx ON files(project_id);
             CREATE INDEX IF NOT EXISTS rules_project_idx ON validation_rules(project_id, file_id);
@@ -155,6 +165,7 @@ def ensure_storage() -> None:
             CREATE INDEX IF NOT EXISTS scans_project_idx ON scan_runs(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS checks_scan_idx ON check_results(scan_id, section_number);
             CREATE INDEX IF NOT EXISTS transformations_file_idx ON transformations(file_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS parsing_project_idx ON parsing_configs(project_id, status);
             """
         )
         columns = {row[1] for row in connection.execute("PRAGMA table_info(findings)").fetchall()}
@@ -370,6 +381,8 @@ def ensure_storage() -> None:
                 )
                 connection.execute("UPDATE projects SET needs_rescan = 1 WHERE id = ?", (row["project_id"],))
             connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (8, datetime('now'))")
+        if connection.execute("SELECT 1 FROM schema_migrations WHERE version = 9").fetchone() is None:
+            connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (9, datetime('now'))")
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

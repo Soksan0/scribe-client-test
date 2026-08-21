@@ -350,10 +350,36 @@ def is_valid_blood_pressure(value: str) -> bool:
     return 40 <= diastolic < systolic <= 260
 
 
-def profile_delimited(path: Path, filename: str) -> dict[str, Any]:
+def profile_delimited(path: Path, filename: str, parsing_config: dict[str, Any] | None = None) -> dict[str, Any]:
     content = path.read_bytes()
-    text, encoding, warnings = decode_bytes(content)
-    delimiter = detect_delimiter(text, filename)
+    config = parsing_config or {}
+    requested_encoding = config.get("encoding")
+    if requested_encoding:
+        try:
+            text = content.decode(str(requested_encoding))
+        except (LookupError, UnicodeDecodeError) as error:
+            raise ValueError(f"The file could not be decoded as {requested_encoding}") from error
+        encoding, warnings = str(requested_encoding), []
+    else:
+        text, encoding, warnings = decode_bytes(content)
+    delimiter = str(config.get("delimiter") or detect_delimiter(text, filename))
+    if delimiter not in {",", "\t", ";", "|"}:
+        raise ValueError("Delimiter must be comma, tab, semicolon, or pipe")
+    header_row = int(config.get("header_row") or 1)
+    if header_row < 1:
+        raise ValueError("Header row must be at least 1")
+    if header_row > 1:
+        try:
+            raw_rows = list(csv.reader(io.StringIO(text), delimiter=delimiter, strict=True))
+        except csv.Error as error:
+            raise ValueError(f"Malformed CSV quoting: {error}") from error
+        if header_row > len(raw_rows):
+            raise ValueError(f"Header row {header_row} is outside the file")
+        staged = io.StringIO()
+        writer = csv.writer(staged, delimiter=delimiter, lineterminator="\n")
+        writer.writerows(raw_rows[header_row - 1 :])
+        text = staged.getvalue()
+        warnings.append(f"Rows 1-{header_row - 1} were treated as metadata and excluded from the analysis table.")
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter, strict=True)
     headers = reader.fieldnames or []
     if not headers:
@@ -395,7 +421,7 @@ def profile_delimited(path: Path, filename: str) -> dict[str, Any]:
             }
             for header in headers
         ]
-        return {"sha256": hashlib.sha256(content).hexdigest(), "encoding": encoding, "encoding_confidence": "high" if encoding.startswith("utf-8") else "medium", "delimiter": delimiter, "delimiter_confidence": "low", "schema_fingerprint": hashlib.sha256(json_schema(headers).encode("utf-8")).hexdigest(), "row_count": row_count, "column_count": len(headers), "columns": profiles, "candidate_id_columns": [], "warnings": warnings, "findings": [asdict(finding)]}
+        return {"sha256": hashlib.sha256(content).hexdigest(), "encoding": encoding, "encoding_confidence": "high" if encoding.startswith("utf-8") else "medium", "delimiter": delimiter, "delimiter_confidence": "low", "schema_fingerprint": hashlib.sha256(json_schema(headers).encode("utf-8")).hexdigest(), "row_count": row_count, "column_count": len(headers), "columns": profiles, "candidate_id_columns": [], "warnings": warnings, "findings": [asdict(finding)], "parsing_config": config}
     columns: dict[str, list[str]] = {header: [] for header in headers}
     row_hashes: dict[tuple[str, ...], list[int]] = defaultdict(list)
     whitespace: dict[tuple[str, str, str], list[int]] = defaultdict(list)
@@ -422,7 +448,11 @@ def profile_delimited(path: Path, filename: str) -> dict[str, Any]:
         raise ValueError(f"Malformed CSV quoting near row {reader.line_num}: {error}") from error
 
     profiles: list[dict[str, Any]] = []
-    id_columns = [header for header in headers if ID_PATTERN.search(header.strip())]
+    configured_ids = [str(value) for value in config.get("identifier_columns", [])]
+    unknown_ids = [value for value in configured_ids if value not in headers]
+    if unknown_ids:
+        raise ValueError(f"Configured identifier columns do not exist: {unknown_ids}")
+    id_columns = configured_ids or [header for header in headers if ID_PATTERN.search(header.strip())]
     primary_id = id_columns[0] if id_columns else None
     duplicate_header_names = [name for name, count in Counter(headers).items() if count > 1]
     if duplicate_header_names:
@@ -453,6 +483,16 @@ def profile_delimited(path: Path, filename: str) -> dict[str, Any]:
             findings.append(FindingCandidate("empty_column", "medium", "high", "Empty column", f"Every row in {header!r} is missing. Confirm whether this column is intentional.", header, 1, columns[primary_id][0] if primary_id else None, None, None, None, row_count))
         elif len(counts) == 1 and row_count >= 3 and header not in id_columns:
             findings.append(FindingCandidate("constant_column", "low", "high", "Constant-value column", f"All non-missing rows in {header!r} contain the same value. This may be intentional or may indicate a collection problem.", header, 1, columns[primary_id][0] if primary_id else None, next(iter(counts)), None, None, sum(counts.values())))
+        formula_rows = [
+            index for index, value in enumerate(values, start=1)
+            if value.lstrip().startswith(("=", "+", "@")) or (value.lstrip().startswith("-") and parse_decimal(value, header) is None)
+        ]
+        if formula_rows:
+            example = values[formula_rows[0] - 1]
+            findings.append(FindingCandidate("spreadsheet_formula", "high", "needs_confirmation", "Value may execute as a spreadsheet formula", f"{len(formula_rows)} value(s) in {header!r} begin with a spreadsheet formula character. Scribe preserves the research value but flags it before CSV/XLSX use; confirm whether it is intentional text.", header, formula_rows[0], columns[primary_id][formula_rows[0] - 1] if primary_id else None, example, None, None, len(formula_rows)))
+        control_rows = [index for index, value in enumerate(values, start=1) if "\ufffd" in value or any(ord(character) < 32 and character not in "\t\n\r" for character in value)]
+        if control_rows:
+            findings.append(FindingCandidate("broken_text_encoding", "high", "needs_confirmation", "Broken Unicode or control characters", f"{len(control_rows)} value(s) in {header!r} contain replacement or control characters. Preserve them until the source encoding or intended text is confirmed.", header, control_rows[0], columns[primary_id][control_rows[0] - 1] if primary_id else None, values[control_rows[0] - 1], None, None, len(control_rows)))
         if AGE_PATTERN.search(header):
             for index, value in enumerate(values, start=1):
                 if is_missing_value(value, header):
@@ -575,6 +615,16 @@ def profile_delimited(path: Path, filename: str) -> dict[str, Any]:
                     findings.append(FindingCandidate("invalid_type", "high", "high" if proposed is not None else "needs_confirmation", f"Value does not match mostly {expected} column", explanation, header, rows[0], columns[primary_id][rows[0] - 1] if primary_id else None, value, proposed, operation, len(rows)))
     relational_findings, relational_cells, arithmetic_relationship_verified = detect_relational_inferences(headers, columns, primary_id)
     findings.extend(relational_findings)
+    for configured_marker in {str(value) for value in config.get("missing_tokens", []) if str(value) != ""}:
+        for header, values in columns.items():
+            rows = [index + 1 for index, value in enumerate(values) if value == configured_marker]
+            if rows and not is_missing_value(configured_marker, header):
+                findings.append(FindingCandidate(
+                    "missing_code_normalization", "medium", "high", "Normalize confirmed missing code",
+                    f"{configured_marker!r} was explicitly confirmed as a missing token in the parsing configuration. Scribe can normalize these {len(rows)} exact value(s) without imputing data.",
+                    header, rows[0], columns[primary_id][rows[0] - 1] if primary_id else None,
+                    configured_marker, "", {"type": "normalize_missing", "column": header, "before": configured_marker, "after": "", "rows": rows}, len(rows),
+                ))
     for (header, marker), marker_rows in explicit_missing_groups.items():
         remaining_rows = [row for row in marker_rows if (row, header) not in relational_cells]
         if remaining_rows:
@@ -624,7 +674,7 @@ def profile_delimited(path: Path, filename: str) -> dict[str, Any]:
         if not id_columns:
             findings.append(FindingCandidate("identity_not_verifiable", "high", "needs_confirmation", "Participant identity cannot be verified", f"{entity_column!r} resembles a participant name, but no reliable identifier column was detected. Names are not assumed unique; acknowledge this limitation or identify a primary/composite key.", entity_column, None, None, None, None, None, row_count))
     findings.sort(key=lambda item: ({"critical": 0, "high": 1, "medium": 2, "low": 3}[item.severity], item.row_number or 0))
-    return {"sha256": hashlib.sha256(content).hexdigest(), "encoding": encoding, "encoding_confidence": "high" if encoding.startswith("utf-8") else "medium", "delimiter": delimiter, "delimiter_confidence": "high" if len(headers) > 1 else "low", "schema_fingerprint": hashlib.sha256(json_schema(headers).encode("utf-8")).hexdigest(), "row_count": row_count, "column_count": len(headers), "columns": profiles, "candidate_id_columns": id_columns, "warnings": warnings, "verified_relationships": ([{"kind": "arithmetic", "equation": "quantity * unit_price = total"}] if arithmetic_relationship_verified else []), "findings": [asdict(item) for item in findings]}
+    return {"sha256": hashlib.sha256(content).hexdigest(), "encoding": encoding, "encoding_confidence": "high" if encoding.startswith("utf-8") else "medium", "delimiter": delimiter, "delimiter_confidence": "high" if len(headers) > 1 else "low", "schema_fingerprint": hashlib.sha256(json_schema(headers).encode("utf-8")).hexdigest(), "row_count": row_count, "column_count": len(headers), "columns": profiles, "candidate_id_columns": id_columns, "warnings": warnings, "verified_relationships": ([{"kind": "arithmetic", "equation": "quantity * unit_price = total"}] if arithmetic_relationship_verified else []), "findings": [asdict(item) for item in findings], "parsing_config": config}
 
 
 def json_schema(headers: list[str]) -> str:

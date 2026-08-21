@@ -7,9 +7,30 @@ from pathlib import Path
 from backend.app.exporting import apply_operations, apply_xlsx_operations, coalesce_operations, generate_format_r_script, generate_r_script
 from backend.app.profiling import profile_delimited
 from backend.app.formats import profile_dataset
+from backend.app.validation import validate_format_contract, validate_operation_result
+from backend.app.survey_quality import detect_survey_quality
 
 
 class ProfilingTests(unittest.TestCase):
+    def test_survey_quality_checks_require_configuration_and_never_propose_edits(self) -> None:
+        import pandas as pd
+
+        frame = pd.DataFrame({
+            "participant_id": ["P1", "P1", "P2"],
+            "q1": [1, 1, 5], "q2": [1, 1, 4], "q3": [1, 1, 3],
+            "attention": [2, 1, 2], "duration": [10, 12, 100],
+        })
+        self.assertEqual(detect_survey_quality(frame, {}), [])
+        findings = detect_survey_quality(frame, {
+            "participant_keys": ["participant_id"], "allowed_repeats": False,
+            "item_groups": [{"name": "Scale", "columns": ["q1", "q2", "q3"], "minimum": 1, "maximum": 5}],
+            "attention_checks": [{"column": "attention", "expected_values": [2]}],
+            "timestamp_columns": {"duration": "duration"},
+        })
+        categories = {item["category"] for item in findings}
+        self.assertTrue({"survey_duplicate_submission", "survey_straightlining", "survey_attention_check"}.issubset(categories))
+        self.assertTrue(all("operation" not in item for item in findings))
+
     def test_derives_only_proven_transaction_values_and_excludes_ambiguous_reverse_mapping(self) -> None:
         import csv
 
@@ -311,6 +332,51 @@ class ProfilingTests(unittest.TestCase):
         self.assertIn('"occupation"', script)
         self.assertIn("target_rows <- c(4)", script)
         self.assertIn("cleaned/reviewed.csv", script)
+        self.assertIn("col_character", script)
+        self.assertIn("na = character()", script)
+        self.assertIn("length(matching_rows) == length(target_rows)", script)
+
+    def test_change_ledger_rejects_an_unapproved_shape_preserving_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.csv"
+            reviewed = Path(folder) / "reviewed.csv"
+            source.write_text("id,value\n001, dirty \n002,valid\n", encoding="utf-8")
+            reviewed.write_text("id,value\n001,dirty\n002,corrupted\n", encoding="utf-8")
+            operation = {"type": "trim", "column": "value", "before": " dirty ", "after": "dirty", "rows": [1]}
+            item = {
+                "id": "file_fixture",
+                "format": "csv",
+                "profile": {"encoding": "utf-8", "delimiter": ","},
+            }
+            with self.assertRaisesRegex(ValueError, "does not match the approved operation plan"):
+                validate_operation_result(item, source, reviewed, [operation])
+
+    def test_change_ledger_preserves_leading_zero_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.csv"
+            reviewed = Path(folder) / "reviewed.csv"
+            source.write_text("id,value\n001, dirty \n002,valid\n", encoding="utf-8")
+            operation = {"type": "trim", "column": "value", "before": " dirty ", "after": "dirty", "rows": [1]}
+            apply_operations(source, reviewed, [operation])
+            item = {
+                "id": "file_fixture",
+                "format": "csv",
+                "profile": {"encoding": "utf-8", "delimiter": ","},
+            }
+            validation = validate_operation_result(item, source, reviewed, [operation])
+        self.assertEqual(validation["expected_changed_cells"], 1)
+        self.assertEqual(validation["unexpected_changed_cells"], 0)
+
+    def test_deterministic_cell_cleaning_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.csv"
+            first = Path(folder) / "first.csv"
+            second = Path(folder) / "second.csv"
+            source.write_text("id,value\n001, dirty \n", encoding="utf-8")
+            operation = {"type": "trim", "column": "value", "before": " dirty ", "after": "dirty", "rows": [1]}
+            apply_operations(source, first, [operation])
+            apply_operations(first, second, [operation])
+            self.assertEqual(first.read_bytes(), second.read_bytes())
 
     def test_generated_r_script_applies_cell_changes_before_deletions_and_type_conversion(self) -> None:
         operations = [
@@ -354,12 +420,17 @@ class ProfilingTests(unittest.TestCase):
             sheet.append(["P001", "Teacher  "])
             workbook.create_sheet("Codebook")["A1"] = "Do not change"
             workbook.save(source)
-            apply_xlsx_operations(source, output, [{"type": "trim", "column": "occupation", "before": "Teacher  ", "after": "Teacher", "rows": [1]}], "Participants")
+            operation = {"type": "trim", "column": "occupation", "before": "Teacher  ", "after": "Teacher", "rows": [1]}
+            profile = profile_dataset(source, source.name)
+            apply_xlsx_operations(source, output, [operation], "Participants")
             reviewed = load_workbook(output)
             original = load_workbook(source)
             self.assertEqual(reviewed["Participants"]["B2"].value, "Teacher")
             self.assertEqual(reviewed["Codebook"]["A1"].value, "Do not change")
             self.assertEqual(original["Participants"]["B2"].value, "Teacher  ")
+            item = {"id": "file_xlsx", "format": "xlsx", "profile": profile}
+            self.assertEqual(validate_operation_result(item, source, output, [operation])["status"], "passed")
+            self.assertEqual(validate_format_contract(item, source, output, [operation])["status"], "passed")
 
     def test_format_specific_r_scripts(self) -> None:
         script = generate_format_r_script("study.sav", "study_reviewed.sav", [], "sav")
@@ -388,6 +459,9 @@ class ProfilingTests(unittest.TestCase):
                     from backend.app.exporting import apply_statistical_operations
                     apply_statistical_operations(source, destination, [operation], file_format)
                     reviewed = profile_dataset(destination, destination.name)
+                    item = {"id": f"file_{file_format}", "format": file_format, "profile": profile}
+                    self.assertEqual(validate_operation_result(item, source, destination, [operation])["status"], "passed")
+                    self.assertEqual(validate_format_contract(item, source, destination, [operation])["status"], "passed")
                     self.assertEqual(reviewed["row_count"], 2)
                     self.assertEqual(source.read_bytes(), before)
 

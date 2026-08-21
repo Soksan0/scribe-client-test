@@ -121,4 +121,6 @@ def _delete_dependencies(connection: Any, project_id: str) -> None:
     connection.execute("DELETE FROM exports WHERE project_id = ?", (project_id,))
     connection.execute("DELETE FROM audit_events WHERE project_id = ?", (project_id,))
     connection.execute("DELETE FROM scan_runs WHERE project_id = ?", (project_id,))
+    connection.execute("DELETE FROM parsing_configs WHERE project_id = ?", (project_id,))
+    connection.execute("DELETE FROM study_configs WHERE project_id = ?", (project_id,))
     connection.execute("DELETE FROM files WHERE project_id = ?", (project_id,))

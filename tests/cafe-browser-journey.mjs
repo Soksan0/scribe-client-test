@@ -46,16 +46,20 @@ try {
   await page.getByText(/7 pending findings/).waitFor({ timeout: 30_000 });
 
   await page.locator('a[href$="/issues"]').first().click();
+  const reviewActions = [
+    { name: /Acknowledge limitation/, notice: "Limitation acknowledged with your rationale." },
+    { name: /Mark false positive/, notice: "Finding marked as a false positive." },
+    { name: /Defer decision/, notice: "Finding deferred for later review." },
+  ];
   for (let index = 0; index < 7; index += 1) {
     const pendingItems = page.locator(".issue-list > button:has(.status-pill.pending)");
     const pendingFinding = pendingItems.first();
     await pendingFinding.waitFor();
     await pendingFinding.click();
     await page.getByText("Recommended cleaning strategies").waitFor();
-    await page.getByRole("button", { name: /Acknowledge limitation/ }).click();
-    await page.getByText("Click to save this review").waitFor();
-    await page.getByRole("button", { name: /Acknowledge limitation/ }).click();
-    await page.getByText("Limitation acknowledged with your rationale.").waitFor();
+    const action = reviewActions[index % reviewActions.length];
+    await page.getByRole("button", { name: action.name }).click();
+    await page.getByText(action.notice).waitFor();
     await page.getByText(new RegExp(`${6 - index} pending findings`)).first().waitFor();
   }
   assert.equal(await page.locator(".issue-list > button:has(.status-pill.pending)").count(), 0);

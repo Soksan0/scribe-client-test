@@ -70,6 +70,118 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertIn("could not read", unreadable.json()["detail"].lower())
         self.assertEqual(self.client.get(f"/api/projects/{project_id}/files").json(), [])
 
+    def test_export_disambiguates_duplicate_original_filenames(self) -> None:
+        project_id = self.create_project()
+        for value in ("one", "two"):
+            response = self.client.post(
+                f"/api/projects/{project_id}/files?filename=survey.csv",
+                content=f"participant_id,value\n{value},{value}\n".encode(),
+                headers={"content-type": "text/csv"},
+            )
+            self.assertEqual(response.status_code, 201, response.text)
+        exported = self.client.post(f"/api/projects/{project_id}/exports")
+        self.assertEqual(exported.status_code, 201, exported.text)
+        cleaned = sorted(
+            artifact["filename"]
+            for artifact in exported.json()["artifacts"]
+            if artifact["kind"] == "cleaned_dataset"
+        )
+        scripts = sorted(
+            artifact["filename"]
+            for artifact in exported.json()["artifacts"]
+            if artifact["kind"] == "r_script"
+        )
+        self.assertEqual(len(cleaned), 2)
+        self.assertEqual(len(set(cleaned)), 2)
+        self.assertTrue(all(name.startswith("survey_cleaned_") for name in cleaned))
+        self.assertEqual(len(set(scripts)), 2)
+
+    def test_manual_correction_and_column_exclusion_are_audited_and_reversible(self) -> None:
+        project_id = self.create_project()
+        uploaded, _ = self.upload_seed(project_id)
+        findings = self.client.get(f"/api/projects/{project_id}/findings?limit=500").json()["items"]
+        row_id = next(item["row_id"] for item in findings if item.get("row_id") and item.get("row_number") == 1)
+        correction = self.client.post(
+            f"/api/projects/{project_id}/manual-operations",
+            json={
+                "file_id": uploaded["id"],
+                "kind": "cell_correction",
+                "row_id": row_id,
+                "column": "age",
+                "before": "30",
+                "after": "31",
+                "rationale": "Confirmed against the signed source form",
+                "evidence": "Source form participant P001 records age 31",
+            },
+        )
+        self.assertEqual(correction.status_code, 201, correction.text)
+        reviewed = self.client.get(f"/api/projects/{project_id}/files/{uploaded['id']}/preview?version=reviewed").json()
+        self.assertEqual(reviewed["rows"][0]["values"]["age"], "31")
+
+        exclusion = self.client.post(
+            f"/api/projects/{project_id}/manual-operations",
+            json={
+                "file_id": uploaded["id"],
+                "kind": "exclude_column",
+                "column": "occupation",
+                "rationale": "Free-text occupation is outside the preregistered analysis",
+                "evidence": "Preregistered analysis plan section 4 excludes occupation",
+            },
+        )
+        self.assertEqual(exclusion.status_code, 201, exclusion.text)
+        after_exclusion = self.client.get(f"/api/projects/{project_id}/files/{uploaded['id']}/preview?version=reviewed").json()
+        self.assertNotIn("occupation", after_exclusion["columns"])
+
+        undone = self.client.post(f"/api/projects/{project_id}/findings/{exclusion.json()['finding_id']}/undo")
+        self.assertEqual(undone.status_code, 200, undone.text)
+        restored = self.client.get(f"/api/projects/{project_id}/files/{uploaded['id']}/preview?version=reviewed").json()
+        self.assertIn("occupation", restored["columns"])
+
+    def test_parsing_confirmation_handles_metadata_rows_and_builds_canonical_snapshot(self) -> None:
+        project_id = self.create_project()
+        uploaded = self.client.post(
+            f"/api/projects/{project_id}/files?filename=qualtrics.csv",
+            content=b"Survey export generated 2026-08-21\nparticipant_id,score\n001,5\n002,-9\n",
+            headers={"content-type": "text/csv"},
+        )
+        self.assertEqual(uploaded.status_code, 201, uploaded.text)
+        file_id = uploaded.json()["id"]
+        configured = self.client.put(
+            f"/api/projects/{project_id}/files/{file_id}/parsing-config",
+            json={
+                "header_row": 2,
+                "delimiter": ",",
+                "encoding": "utf-8",
+                "date_locale": "day_first",
+                "missing_tokens": ["", "-9"],
+                "identifier_columns": ["participant_id"],
+                "variable_labels": {"score": "Questionnaire score"},
+            },
+        )
+        self.assertEqual(configured.status_code, 200, configured.text)
+        self.assertEqual(configured.json()["status"], "confirmed")
+        self.assertTrue(Path(configured.json()["canonical_path"]).exists())
+        preview = self.client.get(f"/api/projects/{project_id}/files/{file_id}/preview?version=original").json()
+        self.assertEqual(preview["columns"], ["participant_id", "score"])
+        self.assertEqual(preview["rows"][0]["values"]["participant_id"], "001")
+        findings = self.client.get(f"/api/projects/{project_id}/findings?file_id={file_id}&limit=500").json()["items"]
+        confirmed_missing = next(item for item in findings if item["category"] == "missing_code_normalization" and item["before"] == "-9")
+        self.assertEqual(confirmed_missing["operation"]["after"], "")
+
+    def test_export_publication_failure_rolls_back_new_artifacts(self) -> None:
+        project_id = self.create_project()
+        self.upload_seed(project_id)
+        with patch("backend.app.main.register_artifact", side_effect=RuntimeError("injected artifact registration failure")):
+            response = self.client.post(f"/api/projects/{project_id}/exports")
+        self.assertEqual(response.status_code, 422, response.text)
+        exported = self.client.get(f"/api/projects/{project_id}/exports").json()
+        self.assertEqual(len(exported), 1)
+        self.assertEqual(exported[0]["status"], "failed")
+        self.assertEqual(exported[0]["artifacts"], [])
+        export_root = Path(self.temporary.name) / "projects" / project_id / "exports"
+        self.assertFalse(any(path.is_file() and path.suffix == ".zip" for path in export_root.glob("*")))
+        self.assertFalse(any(path.is_dir() and not path.name.startswith(".") for path in export_root.glob("*")))
+
     def test_project_upload_preview_decision_undo_and_export(self) -> None:
         project_id = self.create_project()
         uploaded, original = self.upload_seed(project_id)

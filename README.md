@@ -17,6 +17,10 @@ Scribe is a privacy-first research dataset quality-assurance application. It pro
 - Immediate reviewed-version rebuilds from immutable originals and active accepted transformations
 - Same-format reviewed copies for all six supported formats
 - R cleaning scripts generated from the same transformation records as Python exports
+- Exact change-ledger reconciliation that blocks exports containing an unauthorized, missed, reordered, or wrong-row change
+- Parsing confirmation for header rows, delimiter, encoding, locale, missing tokens, and text identifier columns
+- Evidence-backed manual cell correction and explicit row/column exclusion, with exact preconditions and undo
+- Versioned study configuration and review-only survey-quality evidence
 - Downloadable ZIP and individual cleaned files, R scripts, decision/audit records, findings report, readiness report, and hash manifest
 - Local SQLite project state; no authentication or cloud storage, with Gemini disabled unless explicitly configured
 
@@ -91,6 +95,21 @@ The repeatable live-browser journey is in `tests/browser-journey.mjs`. It accept
 
 The benchmark suite includes 10,000-row, hundreds-of-column validation. Format fixtures verify that original files remain unchanged and that supported output data and workbook sheets survive reviewed exports.
 
+Every pull request and pushed branch also runs the backend, format-contract, lint, build, rendered-route, and dependency gates on both Windows and macOS. A green workflow is necessary, but verified clean exports still require a working local R runtime and artifact-level comparison.
+
+## Verified clean versus provisional
+
+- **Provisional review package:** available when you need to inspect reviewed copies, R scripts, findings, decisions, hashes, and limitations. It is not labelled clean or R verified.
+- **Verified clean export:** available only when parsing is confirmed, readiness has no applicable blocker, every output matches its authorized change ledger and format contract, and an executed R reproduction is semantically equivalent to Python's output.
+
+To enable R verification, install R so `Rscript` is available, then install the required packages in R:
+
+```r
+install.packages(c("readr", "dplyr", "openxlsx", "haven"))
+```
+
+Restart Scribe after installing R. The Exports page reports the exact missing runtime or packages and always fails closed if R parsing, preconditions, or comparison produce a warning or mismatch.
+
 ## Privacy and data layout
 
 Runtime project data is stored under `.scribe_data/` unless `SCRIBE_DATA_DIR` is set. Each project has separate immutable `originals/` and generated `exports/` areas. `.scribe_data/` is ignored by source control.
@@ -101,4 +120,6 @@ Scribe does not execute spreadsheet macros, formulas, uploaded scripts, or seria
 
 Scribe's MVP is a dataset-cleaning tool. Document review, methodological QA, citation checking, manuscript review, OCR, transcription, authentication, subscriptions, and cloud infrastructure are intentionally excluded.
 
-Range rules, scale rules, missing-value code mappings, and cross-file relationships require confirmation before they can produce accepted transformations. Advanced Excel objects and format-specific metadata are preserved where the open-source libraries safely support them; any known limitation must be shown before export.
+Range rules, scale rules, missing-value code mappings, and cross-file relationships require confirmation before they can produce accepted transformations. Survey response-quality checks require explicit study configuration and remain evidence for human review, never automatic deletion. Advanced Excel objects and format-specific metadata are preserved only where the declared format adapter supports them; unsupported constructs block a verified claim.
+
+Profiling and export currently run in the local request process and can use substantial memory for large files. The 250 MB upload size is a safety ceiling, not a promise that every file at that boundary fits every computer. Until the durable background worker and bounded-memory profiling gate are complete, test large datasets on copies and keep the Scribe window open during processing.

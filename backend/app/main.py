@@ -32,8 +32,9 @@ from .exporting import (
     apply_xlsx_operations,
     coalesce_operations,
     generate_format_r_script,
+    values_equivalent,
 )
-from .formats import load_frame, preview_records, profile_dataset
+from .formats import build_canonical_snapshot, load_frame, preview_records, profile_dataset
 from .lineage import (
     attach_operation_row_ids,
     attach_profile_row_ids,
@@ -45,6 +46,8 @@ from .lineage import (
 )
 from .profiling import AGE_PATTERN, CATEGORICAL_PATTERN, SCALE_PATTERN, is_missing_value, is_valid_blood_pressure, is_valid_email, is_valid_phone, parse_date_with_quality, parse_number_word
 from .project_lifecycle import move_to_trash, permanently_delete, restore_from_trash
+from .survey_quality import detect_survey_quality
+from .validation import validate_format_contract, validate_operation_result
 
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 ENGINE_VERSION = "research-grade-1"
@@ -92,6 +95,7 @@ def persisted_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "schema_fingerprint": profile.get("schema_fingerprint"),
         "encoding_confidence": profile.get("encoding_confidence"),
         "delimiter_confidence": profile.get("delimiter_confidence"),
+        "parsing_config": profile.get("parsing_config", {}),
     }
 
 
@@ -124,6 +128,40 @@ class BatchDecisionCreate(BaseModel):
 class FindingDispositionCreate(BaseModel):
     disposition: Literal["acknowledged", "false_positive", "deferred"]
     rationale: str = Field(min_length=1, max_length=2000)
+
+
+class ManualOperationCreate(BaseModel):
+    file_id: str
+    kind: Literal["cell_correction", "exclude_row", "exclude_column"]
+    source_finding_id: str | None = None
+    row_id: str | None = None
+    column: str | None = None
+    before: Any | None = None
+    after: Any | None = None
+    rationale: str = Field(min_length=3, max_length=2000)
+    evidence: str = Field(min_length=3, max_length=4000)
+
+
+class ParsingConfigUpdate(BaseModel):
+    header_row: int = Field(default=1, ge=1, le=100)
+    delimiter: Literal[",", "\t", ";", "|"] | None = None
+    encoding: str | None = Field(default=None, max_length=80)
+    date_locale: Literal["day_first", "month_first", "year_first"] | None = None
+    missing_tokens: list[str] = Field(default_factory=list, max_length=100)
+    identifier_columns: list[str] = Field(default_factory=list, max_length=20)
+    variable_labels: dict[str, str] = Field(default_factory=dict)
+
+
+class StudyConfigUpdate(BaseModel):
+    participant_keys: list[str] = Field(default_factory=list, max_length=20)
+    allowed_repeats: bool = False
+    item_groups: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    timestamp_columns: dict[str, str] = Field(default_factory=dict)
+    completion: dict[str, Any] = Field(default_factory=dict)
+    attention_checks: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    skip_rules: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    missing_codes: dict[str, list[Any]] = Field(default_factory=dict)
+    cross_field_rules: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
 
 
 class ExportCreate(BaseModel):
@@ -176,6 +214,37 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "privacy": "local-only", "service": "scribe", "version": "0.2.0"}
+
+
+@app.get("/api/system/r-status")
+def r_status() -> dict[str, Any]:
+    executable = shutil.which("Rscript")
+    required_packages = ["readr", "dplyr", "openxlsx", "haven"]
+    if not executable:
+        return {
+            "available": False,
+            "ready": False,
+            "version": None,
+            "missing_packages": required_packages,
+            "message": "Rscript is not installed or is not available on PATH.",
+        }
+    try:
+        version_result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=10)
+        version = (version_result.stdout or version_result.stderr).strip().splitlines()[0][:200]
+        package_expression = "required <- c('readr','dplyr','openxlsx','haven'); cat(paste(required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)], collapse=','))"
+        package_result = subprocess.run([executable, "-e", package_expression], capture_output=True, text=True, timeout=30)
+        if package_result.returncode != 0:
+            raise RuntimeError((package_result.stderr or package_result.stdout or "R package check failed").strip())
+        missing = [value for value in package_result.stdout.strip().split(",") if value]
+        return {
+            "available": True,
+            "ready": not missing,
+            "version": version,
+            "missing_packages": missing,
+            "message": "R is ready for verified exports." if not missing else f"Install the missing R packages: {', '.join(missing)}.",
+        }
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        return {"available": True, "ready": False, "version": None, "missing_packages": required_packages, "message": f"R diagnostics failed: {str(error)[:300]}"}
 
 
 @app.get("/api/assistant/status")
@@ -433,26 +502,55 @@ async def upload_file(project_id: str, request: Request, filename: str = Query(m
         connection.execute("INSERT INTO processing_jobs(id, project_id, file_id, job_type, status, progress, created_at) VALUES (?, ?, ?, 'profile', 'processing', 10, ?)", (job_id, project_id, file_id, timestamp))
     try:
         profile = profile_dataset(destination, filename)
+        default_parsing = {
+            "header_row": 1,
+            "delimiter": profile.get("delimiter"),
+            "encoding": profile.get("encoding"),
+            "date_locale": None,
+            "missing_tokens": ["", "N/A", "null", "missing", "."],
+            "identifier_columns": profile.get("candidate_id_columns", []),
+            "variable_labels": {},
+        }
+        profile["parsing_config"] = default_parsing
         attach_profile_row_ids(profile, original_row_ids(file_id, profile["row_count"]))
     except Exception as exc:
         destination.unlink(missing_ok=True)
         with db.connect() as connection:
             connection.execute("UPDATE processing_jobs SET status = 'failed', error = ?, completed_at = ? WHERE id = ?", (str(exc), now(), job_id))
         raise HTTPException(422, f"Scribe could not read this dataset: {exc}") from exc
-    with db.connect() as connection:
-        connection.execute(
-            """INSERT INTO files(id, project_id, filename, format, content_type, size_bytes, sha256,
-            original_path, encoding, delimiter, row_count, column_count, status, profile_json,
-            warnings_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (file_id, project_id, filename, suffix[1:], request.headers.get("content-type", "application/octet-stream"), size_bytes, sha256, str(destination), profile.get("encoding"), profile.get("delimiter"), profile["row_count"], profile["column_count"], "ready", json_dump(persisted_profile(profile)), json_dump(profile["warnings"]), timestamp),
-        )
-        connection.execute("UPDATE files SET original_row_count = ?, original_column_count = ? WHERE id = ?", (profile["row_count"], profile["column_count"], file_id))
-        scan_id = create_scan_record(connection, project_id, file_id, sha256, profile)
-        persist_candidates(connection, project_id, file_id, profile, filename, scan_id)
-        persist_check_results(connection, project_id, file_id, scan_id, profile)
-        connection.execute("UPDATE processing_jobs SET status = 'complete', progress = 100, completed_at = ? WHERE id = ?", (now(), job_id))
-        connection.execute("UPDATE projects SET updated_at = ?, needs_rescan = 0 WHERE id = ?", (timestamp, project_id))
-        audit(connection, project_id, "file_uploaded", {"file_id": file_id, "filename": filename, "sha256": sha256, "finding_count": len(profile["findings"])})
+    canonical_path = project_root(project_id) / "canonical" / f"{file_id}.parquet"
+    try:
+        with db.connect() as connection:
+            connection.execute(
+                """INSERT INTO files(id, project_id, filename, format, content_type, size_bytes, sha256,
+                original_path, encoding, delimiter, row_count, column_count, status, profile_json,
+                warnings_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (file_id, project_id, filename, suffix[1:], request.headers.get("content-type", "application/octet-stream"), size_bytes, sha256, str(destination), profile.get("encoding"), profile.get("delimiter"), profile["row_count"], profile["column_count"], "ready", json_dump(persisted_profile(profile)), json_dump(profile["warnings"]), timestamp),
+            )
+            connection.execute("UPDATE files SET original_row_count = ?, original_column_count = ? WHERE id = ?", (profile["row_count"], profile["column_count"], file_id))
+            config_canonical = json.dumps(default_parsing, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            config_hash = hashlib.sha256(config_canonical.encode("utf-8")).hexdigest()
+            parsing_status = "confirmed" if not profile.get("warnings") else "inferred"
+            snapshot_item = db.row_dict(connection.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone())
+            assert snapshot_item is not None
+            snapshot = build_canonical_snapshot(snapshot_item, canonical_path)
+            connection.execute(
+                """INSERT INTO parsing_configs(file_id, project_id, version, status, config_json, config_hash,
+                canonical_path, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)""",
+                (file_id, project_id, parsing_status, config_canonical, config_hash, snapshot["path"], timestamp, timestamp),
+            )
+            scan_id = create_scan_record(connection, project_id, file_id, sha256, profile)
+            persist_candidates(connection, project_id, file_id, profile, filename, scan_id)
+            persist_check_results(connection, project_id, file_id, scan_id, profile)
+            connection.execute("UPDATE processing_jobs SET status = 'complete', progress = 100, completed_at = ? WHERE id = ?", (now(), job_id))
+            connection.execute("UPDATE projects SET updated_at = ?, needs_rescan = 0 WHERE id = ?", (timestamp, project_id))
+            audit(connection, project_id, "file_uploaded", {"file_id": file_id, "filename": filename, "sha256": sha256, "finding_count": len(profile["findings"])})
+    except Exception as exc:
+        canonical_path.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+        with db.connect() as connection:
+            connection.execute("UPDATE processing_jobs SET status = 'failed', error = ?, completed_at = ? WHERE id = ?", (str(exc), now(), job_id))
+        raise HTTPException(422, f"Scribe could not safely finish importing this dataset: {exc}") from exc
     return get_file(project_id, file_id)
 
 
@@ -504,6 +602,7 @@ def list_files(project_id: str) -> list[dict[str, Any]]:
         for item in files:
             version = latest_version(connection, item["id"])
             item["reviewed_version"] = version
+            item["parsing"] = db.row_dict(connection.execute("SELECT * FROM parsing_configs WHERE file_id = ?", (item["id"],)).fetchone())
             item["finding_count"] = connection.execute("SELECT COUNT(*) FROM findings WHERE file_id = ? AND status != 'superseded'", (item["id"],)).fetchone()[0]
         return files
 
@@ -513,8 +612,116 @@ def get_file(project_id: str, file_id: str) -> dict[str, Any]:
     with db.connect() as connection:
         item = file_record(connection, project_id, file_id)
         item["reviewed_version"] = latest_version(connection, file_id)
+        item["parsing"] = db.row_dict(connection.execute("SELECT * FROM parsing_configs WHERE file_id = ?", (file_id,)).fetchone())
         item["finding_count"] = connection.execute("SELECT COUNT(*) FROM findings WHERE file_id = ? AND status != 'superseded'", (file_id,)).fetchone()[0]
         return item
+
+
+@app.get("/api/projects/{project_id}/files/{file_id}/parsing-config")
+def get_parsing_config(project_id: str, file_id: str) -> dict[str, Any]:
+    with db.connect() as connection:
+        file_record(connection, project_id, file_id)
+        config = db.row_dict(connection.execute("SELECT * FROM parsing_configs WHERE file_id = ?", (file_id,)).fetchone())
+        if config is None:
+            raise HTTPException(404, "Parsing configuration is not available for this legacy dataset")
+        return config
+
+
+@app.put("/api/projects/{project_id}/files/{file_id}/parsing-config")
+def update_parsing_config(project_id: str, file_id: str, payload: ParsingConfigUpdate) -> dict[str, Any]:
+    with db.connect() as connection:
+        item = file_record(connection, project_id, file_id)
+        if connection.execute("SELECT 1 FROM transformations WHERE file_id = ? AND status = 'active' LIMIT 1", (file_id,)).fetchone():
+            raise HTTPException(409, "Undo accepted transformations before changing how the original file is parsed")
+        config = payload.model_dump()
+        profile = profile_dataset(Path(item["original_path"]), item["filename"], config)
+        available_columns = {str(column["name"]) for column in profile.get("columns", [])}
+        unknown_ids = sorted(set(payload.identifier_columns) - available_columns)
+        unknown_labels = sorted(set(payload.variable_labels) - available_columns)
+        if unknown_ids or unknown_labels:
+            raise HTTPException(422, f"Parsing configuration refers to unknown columns: {unknown_ids + unknown_labels}")
+        profile["candidate_id_columns"] = list(payload.identifier_columns)
+        profile["parsing_config"] = config
+        attach_profile_row_ids(profile, original_row_ids(file_id, profile["row_count"]))
+        connection.execute("UPDATE findings SET status = 'superseded', disposition = 'superseded' WHERE file_id = ? AND status != 'superseded'", (file_id,))
+        connection.execute(
+            """UPDATE files SET encoding = ?, delimiter = ?, row_count = ?, column_count = ?, original_row_count = ?,
+               original_column_count = ?, profile_json = ?, warnings_json = ?, status = 'ready' WHERE id = ?""",
+            (profile.get("encoding"), profile.get("delimiter"), profile["row_count"], profile["column_count"], profile["row_count"], profile["column_count"], json_dump(persisted_profile(profile)), json_dump(profile["warnings"]), file_id),
+        )
+        canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        config_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        previous = connection.execute("SELECT version, created_at FROM parsing_configs WHERE file_id = ?", (file_id,)).fetchone()
+        version = int(previous["version"]) + 1 if previous else 1
+        canonical_path = project_root(project_id) / "canonical" / f"{file_id}.parquet"
+        updated_item = db.row_dict(connection.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone())
+        assert updated_item is not None
+        snapshot = build_canonical_snapshot(updated_item, canonical_path)
+        connection.execute(
+            """INSERT INTO parsing_configs(file_id, project_id, version, status, config_json, config_hash, canonical_path, created_at, updated_at)
+               VALUES (?, ?, ?, 'confirmed', ?, ?, ?, ?, ?)
+               ON CONFLICT(file_id) DO UPDATE SET version=excluded.version, status='confirmed', config_json=excluded.config_json,
+               config_hash=excluded.config_hash, canonical_path=excluded.canonical_path, updated_at=excluded.updated_at""",
+            (file_id, project_id, version, canonical, config_hash, snapshot["path"], previous["created_at"] if previous else now(), now()),
+        )
+        scan_id = create_scan_record(connection, project_id, file_id, item["sha256"], profile)
+        persist_candidates(connection, project_id, file_id, profile, item["filename"], scan_id)
+        persist_check_results(connection, project_id, file_id, scan_id, profile)
+        audit(connection, project_id, "parsing_config_confirmed", {"file_id": file_id, "version": version, "config_hash": config_hash})
+        connection.execute("UPDATE projects SET needs_rescan = 0, updated_at = ? WHERE id = ?", (now(), project_id))
+        return {"file_id": file_id, "version": version, "status": "confirmed", "config": config, "config_hash": config_hash, "canonical_path": snapshot["path"], "profile": persisted_profile(profile)}
+
+
+@app.get("/api/projects/{project_id}/study-config")
+def get_study_config(project_id: str) -> dict[str, Any]:
+    ensure_project(project_id)
+    with db.connect() as connection:
+        config = db.row_dict(connection.execute("SELECT * FROM study_configs WHERE project_id = ?", (project_id,)).fetchone())
+        return config or {"project_id": project_id, "version": 0, "status": "not_configured", "config": {}}
+
+
+@app.put("/api/projects/{project_id}/study-config")
+def update_study_config(project_id: str, payload: StudyConfigUpdate) -> dict[str, Any]:
+    ensure_project(project_id)
+    config = payload.model_dump()
+    canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    with db.connect() as connection:
+        available_columns = {
+            str(column["name"])
+            for file_item in db.rows_dict(connection.execute("SELECT profile_json FROM files WHERE project_id = ?", (project_id,)).fetchall())
+            for column in (file_item.get("profile") or {}).get("columns", [])
+        }
+        referenced = set(payload.participant_keys)
+        referenced.update(column for group in payload.item_groups for column in group.get("columns", []))
+        referenced.update(
+            value
+            for key, value in payload.timestamp_columns.items()
+            if key in {"start", "end", "duration"} and isinstance(value, str) and value
+        )
+        referenced.update(payload.completion.get("required_columns", []))
+        referenced.update(check.get("column") for check in payload.attention_checks if check.get("column"))
+        for rule in [*payload.skip_rules, *payload.cross_field_rules]:
+            referenced.update(value for key, value in rule.items() if key.endswith("_column") and value)
+        unknown = sorted(referenced - available_columns)
+        if unknown:
+            raise HTTPException(422, f"Study configuration refers to unknown columns: {unknown}")
+        invalid_operators = sorted({str(rule.get("operator")) for rule in payload.cross_field_rules if rule.get("operator") not in {"==", "!=", "<", "<=", ">", ">="}})
+        if invalid_operators:
+            raise HTTPException(422, f"Unsupported cross-field operators: {invalid_operators}")
+        previous = connection.execute("SELECT version, created_at FROM study_configs WHERE project_id = ?", (project_id,)).fetchone()
+        version = int(previous["version"]) + 1 if previous else 1
+        timestamp = now()
+        connection.execute(
+            """INSERT INTO study_configs(project_id, version, status, config_json, config_hash, created_at, updated_at)
+               VALUES (?, ?, 'confirmed', ?, ?, ?, ?)
+               ON CONFLICT(project_id) DO UPDATE SET version=excluded.version, status='confirmed', config_json=excluded.config_json,
+               config_hash=excluded.config_hash, updated_at=excluded.updated_at""",
+            (project_id, version, canonical, digest, previous["created_at"] if previous else timestamp, timestamp),
+        )
+        connection.execute("UPDATE projects SET needs_rescan = 1, updated_at = ? WHERE id = ?", (timestamp, project_id))
+        audit(connection, project_id, "study_config_confirmed", {"version": version, "config_hash": digest})
+    return {"project_id": project_id, "version": version, "status": "confirmed", "config": config, "config_hash": digest}
 
 
 @app.get("/api/projects/{project_id}/files/{file_id}/preview")
@@ -570,7 +777,10 @@ def reanalyze_project(project_id: str) -> dict[str, Any]:
         with db.connect() as connection:
             version = latest_version(connection, item["id"])
             analysis_path = Path(version["path"]) if version else Path(item["original_path"])
-            profile = profile_dataset(analysis_path, item["filename"])
+            parsing_config = (item.get("profile") or {}).get("parsing_config") or {}
+            scan_parsing = {**parsing_config, "header_row": 1} if version else parsing_config
+            profile = profile_dataset(analysis_path, item["filename"], scan_parsing)
+            profile["parsing_config"] = parsing_config
             source_row_ids = row_ids_for_source(item, version, profile["row_count"])
             attach_profile_row_ids(profile, source_row_ids)
             connection.execute(
@@ -586,6 +796,19 @@ def reanalyze_project(project_id: str) -> dict[str, Any]:
                 source_kind="reviewed" if version else "original",
             )
             persist_candidates(connection, project_id, item["id"], profile, item["filename"], scan_id)
+            study_row = db.row_dict(connection.execute("SELECT * FROM study_configs WHERE project_id = ? AND status = 'confirmed'", (project_id,)).fetchone())
+            if study_row:
+                analysis_frame = load_frame(analysis_path, item["format"], {**(item.get("profile") or {}), "parsing_config": scan_parsing})
+                for survey_finding in detect_survey_quality(analysis_frame, study_row["config"]):
+                    row_number = int(survey_finding["row_number"])
+                    insert_finding(
+                        connection, project_id, item["id"], None, survey_finding["category"], survey_finding["severity"],
+                        "needs_confirmation", survey_finding["title"], survey_finding["explanation"], profile["table_name"],
+                        survey_finding.get("column_name"), row_number, survey_finding.get("before"), None, None,
+                        survey_finding.get("affected_count", 1), scan_id=scan_id,
+                        evidence={"study_config_hash": study_row["config_hash"], "review_only": True},
+                        row_id=source_row_ids[row_number - 1],
+                    )
             rules = db.rows_dict(connection.execute("SELECT * FROM validation_rules WHERE file_id = ? AND status = 'confirmed'", (item["id"],)).fetchall())
             for rule in rules:
                 finding_count += evaluate_rule(connection, project_id, {**item, "profile": {"columns": profile["columns"], "table_name": profile["table_name"], "format_metadata": profile.get("format_metadata", {})}}, rule["id"], rule["rule_type"], rule["parameters"])
@@ -815,7 +1038,7 @@ def disposition_finding(project_id: str, finding_id: str, payload: FindingDispos
             raise HTTPException(409, "Only a pending current finding can receive a review disposition")
         if payload.disposition == "acknowledged" and finding.get("operation") is not None:
             raise HTTPException(422, "Correction proposals must be accepted or rejected; acknowledgement is for review-only evidence")
-        status = "pending" if payload.disposition == "deferred" else ("acknowledged" if payload.disposition == "acknowledged" else "rejected")
+        status = "deferred" if payload.disposition == "deferred" else ("acknowledged" if payload.disposition == "acknowledged" else "rejected")
         decision_id = new_id("dec")
         connection.execute(
             "INSERT INTO decisions(id, finding_id, decision, rationale, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -831,6 +1054,10 @@ def disposition_finding(project_id: str, finding_id: str, payload: FindingDispos
             "impossible_value": 8, "outlier": 8, "rule_range": 8, "date_standardization": 9,
             "ambiguous_date": 9, "rule_date": 9, "invalid_scale": 10, "rule_scale": 10,
             "rule_cross_column": 11, "cross_file": 12, "constant_column": 13, "suspicious_pattern": 13,
+            "survey_duplicate_submission": 4, "survey_invalid_scale": 10, "survey_skip_logic": 11,
+            "survey_cross_field": 11, "survey_incomplete": 13, "survey_straightlining": 13,
+            "survey_attention_check": 13, "survey_speeder": 13, "spreadsheet_formula": 14,
+            "broken_text_encoding": 14,
         }
         section_number = section_by_category.get(finding["category"])
         if payload.disposition == "acknowledged" and finding.get("scan_id") and section_number:
@@ -840,6 +1067,84 @@ def disposition_finding(project_id: str, finding_id: str, payload: FindingDispos
             )
         audit(connection, project_id, "finding_disposition_recorded", {"finding_id": finding_id, "disposition": payload.disposition, "rationale": payload.rationale})
     return {"id": decision_id, "finding_id": finding_id, "status": status, "disposition": payload.disposition, "readiness": readiness(project_id)}
+
+
+@app.post("/api/projects/{project_id}/manual-operations", status_code=201)
+def create_manual_operation(project_id: str, payload: ManualOperationCreate) -> dict[str, Any]:
+    """Record one evidence-backed edit or exclusion through the normal audited plan."""
+    try:
+        with db.connect() as connection:
+            item = file_record(connection, project_id, payload.file_id)
+            version = latest_version(connection, item["id"])
+            source_path = Path(version["path"]) if version else Path(item["original_path"])
+            frame = load_frame(source_path, item["format"], item.get("profile"))
+            source_row_ids = row_ids_for_source(item, version, len(frame))
+            table_name = (item.get("profile") or {}).get("table_name", Path(item["filename"]).stem)
+
+            if payload.kind == "cell_correction":
+                if not payload.row_id or not payload.column:
+                    raise HTTPException(422, "A manual cell correction requires a stable row ID and column")
+                if payload.column not in frame.columns:
+                    raise HTTPException(422, f"Column {payload.column!r} does not exist in the reviewed dataset")
+                if payload.row_id not in source_row_ids:
+                    raise HTTPException(409, "The selected row is no longer present in the current reviewed version")
+                current_index = source_row_ids.index(payload.row_id)
+                current = frame.iloc[current_index][payload.column]
+                if not values_equivalent(current, payload.before):
+                    raise HTTPException(409, f"The reviewed value changed; expected {payload.before!r}, found {current!r}")
+                if values_equivalent(current, payload.after):
+                    raise HTTPException(422, "The corrected value must differ from the current value")
+                original_ordinal = row_ordinal(payload.row_id)
+                operation = {"type": "replace", "column": payload.column, "before": payload.before, "after": payload.after, "rows": [original_ordinal], "row_ids": [payload.row_id], "manual": True, "evidence": payload.evidence}
+                title = "Evidence-backed manual cell correction"
+                before, proposed, row_number, row_id = payload.before, payload.after, current_index + 1, payload.row_id
+            elif payload.kind == "exclude_row":
+                if not payload.row_id:
+                    raise HTTPException(422, "A row exclusion requires a stable row ID")
+                if payload.row_id not in source_row_ids:
+                    raise HTTPException(409, "The selected row is no longer present in the current reviewed version")
+                current_index = source_row_ids.index(payload.row_id)
+                original_ordinal = row_ordinal(payload.row_id)
+                operation = {"type": "delete_rows", "rows": [original_ordinal], "row_ids": [payload.row_id], "manual": True, "evidence": payload.evidence}
+                title = "Explicit research row exclusion"
+                before, proposed, row_number, row_id = frame.iloc[current_index].to_dict(), None, current_index + 1, payload.row_id
+            else:
+                if not payload.column or payload.column not in frame.columns:
+                    raise HTTPException(422, "A column exclusion requires an existing column")
+                operation = {"type": "exclude_column", "column": payload.column, "manual": True, "evidence": payload.evidence}
+                title = "Explicit research column exclusion"
+                before, proposed, row_number, row_id = payload.column, None, None, None
+
+            source_finding = finding_record(connection, project_id, payload.source_finding_id) if payload.source_finding_id else None
+            if source_finding and (source_finding["file_id"] != item["id"] or source_finding["status"] != "pending"):
+                raise HTTPException(409, "The source finding is no longer pending for this dataset")
+            finding_id = insert_finding(
+                connection, project_id, item["id"], None, "manual_operation", "high", "user_confirmed",
+                title, f"Researcher supplied evidence: {payload.evidence}", table_name, payload.column,
+                row_number, before, proposed, operation, 1, scan_id=None,
+                evidence={"source": "manual", "evidence": payload.evidence, "rationale": payload.rationale, "source_finding_id": payload.source_finding_id}, row_id=row_id,
+            )
+            finding = finding_record(connection, project_id, finding_id)
+            decision_id = new_id("dec")
+            connection.execute(
+                "INSERT INTO decisions(id, finding_id, decision, edited_value_json, rationale, created_at) VALUES (?, ?, 'accepted', ?, ?, ?)",
+                (decision_id, finding_id, json_dump(payload.after) if payload.kind == "cell_correction" else None, payload.rationale, now()),
+            )
+            connection.execute("UPDATE findings SET status = 'accepted', disposition = 'change_accepted' WHERE id = ?", (finding_id,))
+            if source_finding:
+                source_decision_id = new_id("dec")
+                connection.execute(
+                    "INSERT INTO decisions(id, finding_id, decision, rationale, created_at) VALUES (?, ?, 'resolved_by_manual_operation', ?, ?)",
+                    (source_decision_id, source_finding["id"], payload.rationale, now()),
+                )
+                connection.execute("UPDATE findings SET status = 'acknowledged', disposition = 'resolved_by_manual_operation' WHERE id = ?", (source_finding["id"],))
+            register_transformation(connection, project_id, finding, decision_id, operation, payload.rationale)
+            connection.execute("UPDATE projects SET needs_rescan = 1, updated_at = ? WHERE id = ?", (now(), project_id))
+            reviewed_version = create_reviewed_version(connection, project_id, item["id"])
+            audit(connection, project_id, "manual_operation_accepted", {"finding_id": finding_id, "kind": payload.kind, "file_id": item["id"], "rationale": payload.rationale})
+    except ValueError as error:
+        raise HTTPException(409, f"Manual operation was not applied because it conflicts with the reviewed plan: {error}") from error
+    return {"finding_id": finding_id, "status": "accepted", "reviewed_version": reviewed_version, "reversible": True, "readiness": readiness(project_id)}
 
 
 @app.post("/api/projects/{project_id}/findings/{finding_id}/decision")
@@ -942,6 +1247,13 @@ def undo_decision(project_id: str, finding_id: str) -> dict[str, Any]:
             connection.execute("UPDATE findings SET status = 'pending', disposition = 'pending' WHERE id = ?", (finding_id,))
             connection.execute("UPDATE transformations SET status = 'reversed', updated_at = ? WHERE finding_id = ? AND status = 'active'", (now(), finding_id))
             connection.execute("INSERT INTO decisions(id, finding_id, decision, rationale, created_at) VALUES (?, ?, 'reversed', ?, ?)", (new_id("dec"), finding_id, f"Reversed previous {previous} decision", now()))
+            source_finding_id = (finding.get("evidence") or {}).get("source_finding_id") if finding.get("category") == "manual_operation" else None
+            if source_finding_id:
+                connection.execute("UPDATE findings SET status = 'pending', disposition = 'pending' WHERE id = ? AND project_id = ? AND disposition = 'resolved_by_manual_operation'", (source_finding_id, project_id))
+                connection.execute(
+                    "INSERT INTO decisions(id, finding_id, decision, rationale, created_at) SELECT ?, id, 'reopened_after_manual_undo', ?, ? FROM findings WHERE id = ? AND project_id = ?",
+                    (new_id("dec"), f"Reopened because manual operation {finding_id} was reversed", now(), source_finding_id, project_id),
+                )
             file_id = finding["file_id"]
             cascaded = dependent_accepted_findings(connection, file_id, finding)
             for dependent in cascaded:
@@ -981,6 +1293,13 @@ def create_export(project_id: str, payload: ExportCreate | None = None) -> dict[
     kind = (payload or ExportCreate()).kind
     with db.connect() as connection:
         if kind == "verified":
+            unconfirmed_parsing = connection.execute(
+                """SELECT COUNT(*) FROM files f LEFT JOIN parsing_configs pc ON pc.file_id = f.id
+                   WHERE f.project_id = ? AND COALESCE(pc.status, 'missing') != 'confirmed'""",
+                (project_id,),
+            ).fetchone()[0]
+            if unconfirmed_parsing:
+                raise HTTPException(409, f"Verified export is blocked until parsing assumptions are confirmed for {unconfirmed_parsing} dataset(s)")
             pending = connection.execute("SELECT COUNT(*) FROM findings WHERE project_id = ? AND status = 'pending'", (project_id,)).fetchone()[0]
             if pending:
                 raise HTTPException(409, f"Verified export is blocked until {pending} pending finding(s) are reviewed")
@@ -992,8 +1311,9 @@ def create_export(project_id: str, payload: ExportCreate | None = None) -> dict[
             ).fetchone()[0]
             if blocking_checks:
                 raise HTTPException(409, "Verified export is blocked because applicable checklist checks have not passed or been acknowledged")
-            if not shutil.which("Rscript"):
-                raise HTTPException(409, "Verified export requires a local Rscript runtime so Scribe can reproduce and compare the cleaned data")
+            runtime = r_status()
+            if not runtime["ready"]:
+                raise HTTPException(409, runtime["message"])
     export_id, timestamp = new_id("exp"), now()
     root = project_root(project_id) / "exports"
     partial = root / f".{export_id}.partial"
@@ -1009,6 +1329,7 @@ def create_export(project_id: str, payload: ExportCreate | None = None) -> dict[
                 raise ValueError("Upload at least one dataset before exporting")
             manifest: dict[str, Any] = {"export_id": export_id, "project_id": project_id, "kind": kind, "created_at": timestamp, "engine_version": ENGINE_VERSION, "files": []}
             file_validations: list[dict[str, Any]] = []
+            filename_counts = Counter(item["filename"].casefold() for item in files)
             for item in files:
                 operations = active_operations(connection, item["id"])
                 source = Path(item["original_path"])
@@ -1019,29 +1340,36 @@ def create_export(project_id: str, payload: ExportCreate | None = None) -> dict[
                 original_copy = partial / "originals" / safe_name
                 original_copy.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, original_copy)
-                cleaned_name = cleaned_export_filename(item["filename"])
+                discriminator = item["id"].split("_", 1)[-1][:8] if filename_counts[item["filename"].casefold()] > 1 else None
+                cleaned_name = cleaned_export_filename(item["filename"], discriminator)
                 cleaned = partial / "cleaned" / cleaned_name
                 output = apply_file_operations(item, source, cleaned, operations)
-                cleaned_profile = profile_dataset(cleaned, cleaned_name)
-                expected_rows = int(item.get("row_count") or cleaned_profile["row_count"]) - len({row for operation in operations if operation.get("type") == "delete_rows" for row in operation.get("rows", [])})
-                output_valid = cleaned_profile["row_count"] == expected_rows and cleaned_profile["column_count"] == int(item.get("column_count") or cleaned_profile["column_count"])
-                if not output_valid:
-                    raise ValueError(f"Reopened output for {item['filename']} did not preserve the expected shape")
-                script = partial / "scripts" / f"clean_{Path(item['filename']).stem}.R"
+                change_validation = validate_operation_result(item, source, cleaned, operations)
+                format_validation = validate_format_contract(item, source, cleaned, operations)
+                script_discriminator = f"_{discriminator}" if discriminator else ""
+                script = partial / "scripts" / f"clean_{Path(item['filename']).stem}{script_discriminator}.R"
                 script.parent.mkdir(parents=True, exist_ok=True)
                 profile = item.get("profile") or {}
-                script_text = generate_format_r_script(safe_name, cleaned_name, operations, item["format"], item.get("delimiter"), profile.get("table_name"))
+                script_text = generate_format_r_script(safe_name, cleaned_name, operations, item["format"], item.get("delimiter"), profile.get("table_name"), profile)
                 script.write_text(script_text, encoding="utf-8")
-                r_reproduced, r_detail = verify_r_reproduction(item, source, cleaned, safe_name, cleaned_name, script_text)
+                r_reproduced, r_detail = verify_r_reproduction(item, source, cleaned, safe_name, cleaned_name, script_text, operations)
                 plan_hash = hashlib.sha256("\n".join(operation_hash(operation) for operation in operations).encode("utf-8")).hexdigest()
-                file_validation = {"file_id": item["id"], "source_hash_valid": True, "output_reopened": True, "shape_valid": output_valid, "r_reproduced": r_reproduced, "r_detail": r_detail}
+                file_validation = {
+                    "file_id": item["id"],
+                    "source_hash_valid": True,
+                    "output_reopened": True,
+                    "shape_valid": True,
+                    "change_validation": change_validation,
+                    "format_contract": format_validation,
+                    "r_reproduced": r_reproduced,
+                    "r_detail": r_detail,
+                }
                 file_validations.append(file_validation)
                 manifest["files"].append({"file_id": item["id"], "original": safe_name, "original_sha256": actual_source_hash, "cleaned": cleaned_name, "cleaned_sha256": output["sha256"], "r_script": script.name, "accepted_transformations": len(operations), "plan_hash": plan_hash, "validation": file_validation})
-            validation = {"status": "passed" if all(item["source_hash_valid"] and item["output_reopened"] and item["shape_valid"] for item in file_validations) and (kind == "review" or all(item["r_reproduced"] for item in file_validations)) else "failed", "kind": kind, "r_reproduced": all(item["r_reproduced"] for item in file_validations), "files": file_validations}
+            validation = {"status": "passed" if all(item["source_hash_valid"] and item["output_reopened"] and item["shape_valid"] and item["change_validation"]["status"] == "passed" and item["format_contract"]["status"] == "passed" for item in file_validations) and (kind == "review" or all(item["r_reproduced"] for item in file_validations)) else "failed", "kind": kind, "r_reproduced": all(item["r_reproduced"] for item in file_validations), "files": file_validations}
             if kind == "verified" and validation["status"] != "passed":
                 raise ValueError("R reproduction or output validation did not match the Python-reviewed data")
             manifest["validation"] = validation
-            connection.execute("UPDATE exports SET status = 'complete', validation_json = ?, completed_at = ? WHERE id = ?", (json_dump(validation), now(), export_id))
             events = db.rows_dict(connection.execute("SELECT * FROM audit_events WHERE project_id = ? ORDER BY created_at", (project_id,)).fetchall())
             findings = db.rows_dict(connection.execute("SELECT f.*, files.filename FROM findings f JOIN files ON files.id = f.file_id WHERE f.project_id = ? ORDER BY f.created_at", (project_id,)).fetchall())
             decisions = db.rows_dict(connection.execute("SELECT d.*, f.project_id, f.file_id, f.title AS finding_title FROM decisions d JOIN findings f ON f.id = d.finding_id WHERE f.project_id = ? ORDER BY d.created_at", (project_id,)).fetchall())
@@ -1052,7 +1380,7 @@ def create_export(project_id: str, payload: ExportCreate | None = None) -> dict[
                 if path.is_file():
                     archive.write(path, path.relative_to(final))
         with db.connect() as connection:
-            connection.execute("UPDATE exports SET status = 'complete', bundle_path = ?, completed_at = ? WHERE id = ?", (str(zip_path), now(), export_id))
+            connection.execute("UPDATE exports SET status = 'complete', bundle_path = ?, validation_json = ?, completed_at = ? WHERE id = ?", (str(zip_path), json_dump(validation), now(), export_id))
             register_artifact(connection, export_id, "bundle", zip_path)
             for path in final.rglob("*"):
                 if path.is_file():
@@ -1060,13 +1388,16 @@ def create_export(project_id: str, payload: ExportCreate | None = None) -> dict[
             audit(connection, project_id, "export_created", {"export_id": export_id, "artifact_count": connection.execute("SELECT COUNT(*) FROM export_artifacts WHERE export_id = ?", (export_id,)).fetchone()[0]})
     except Exception as exc:
         shutil.rmtree(partial, ignore_errors=True)
+        shutil.rmtree(final, ignore_errors=True)
+        if zip_path.exists():
+            zip_path.unlink()
         with db.connect() as connection:
             connection.execute("UPDATE exports SET status = 'failed', error = ?, completed_at = ? WHERE id = ?", (str(exc), now(), export_id))
         raise HTTPException(422, f"Export failed: {exc}") from exc
     return next(item for item in list_exports(project_id) if item["id"] == export_id)
 
 
-def verify_r_reproduction(item: dict[str, Any], source: Path, python_output: Path, safe_name: str, cleaned_name: str, script_text: str) -> tuple[bool, str]:
+def verify_r_reproduction(item: dict[str, Any], source: Path, python_output: Path, safe_name: str, cleaned_name: str, script_text: str, operations: list[dict[str, Any]]) -> tuple[bool, str]:
     rscript = shutil.which("Rscript")
     if not rscript:
         return False, "Rscript is not installed; this review package is not a verified clean export."
@@ -1093,16 +1424,19 @@ def verify_r_reproduction(item: dict[str, Any], source: Path, python_output: Pat
             right = r_frame.fillna("").astype(str).reset_index(drop=True)
             if not left.equals(right):
                 return False, "R output values differ from Python output."
+            validate_operation_result(item, source, r_output, operations)
+            validate_format_contract(item, source, r_output, operations)
         except Exception as error:
             return False, f"R output comparison failed: {error}"[:500]
     return True, "R script reproduced the canonical Python-reviewed values."
 
 
-def cleaned_export_filename(filename: str) -> str:
+def cleaned_export_filename(filename: str, discriminator: str | None = None) -> str:
     path = Path(filename)
     suffix = path.suffix
     stem = path.stem or filename
-    return f"{stem}_cleaned{suffix}"
+    collision_suffix = f"_{discriminator}" if discriminator else ""
+    return f"{stem}_cleaned{collision_suffix}{suffix}"
 
 
 @app.get("/api/exports/{export_id}/download")
@@ -1156,13 +1490,13 @@ def calculate_readiness(connection: Any, project_id: str) -> dict[str, Any]:
     category_sections = {
         1: {"corrupted_row"}, 2: {"duplicate_column_name", "duplicate_column", "empty_column"},
         3: {"missing_value", "missing_code_normalization", "rule_required", "rule_missing_codes"},
-        4: {"duplicate_id", "duplicate_row", "near_duplicate", "potential_duplicate", "identity_not_verifiable", "rule_unique"},
+        4: {"duplicate_id", "duplicate_row", "near_duplicate", "potential_duplicate", "identity_not_verifiable", "rule_unique", "survey_duplicate_submission"},
         5: {"invalid_type", "rule_type"}, 6: {"whitespace", "text_normalization"},
         7: {"inconsistent_category", "rule_allowed_values"}, 8: {"invalid_type", "impossible_value", "outlier", "rule_range"},
-        9: {"date_standardization", "ambiguous_date", "rule_date"}, 10: {"invalid_scale", "rule_scale"},
-        11: {"rule_cross_column"}, 12: {"cross_file"},
-        13: {"constant_column", "outlier", "suspicious_pattern"},
-        14: {"whitespace", "text_normalization", "corrupted_row"}, 15: set(), 16: set(), 17: pending_categories,
+        9: {"date_standardization", "ambiguous_date", "rule_date"}, 10: {"invalid_scale", "rule_scale", "survey_invalid_scale"},
+        11: {"rule_cross_column", "survey_skip_logic", "survey_cross_field"}, 12: {"cross_file"},
+        13: {"constant_column", "outlier", "suspicious_pattern", "survey_incomplete", "survey_straightlining", "survey_attention_check", "survey_speeder"},
+        14: {"whitespace", "text_normalization", "corrupted_row", "spreadsheet_formula", "broken_text_encoding"}, 15: set(), 16: set(), 17: pending_categories,
     }
     check_rows = db.rows_dict(connection.execute(
         """SELECT cr.* FROM check_results cr JOIN scan_runs sr ON sr.id = cr.scan_id
@@ -1203,6 +1537,12 @@ def calculate_readiness(connection: Any, project_id: str) -> dict[str, Any]:
             check_status = "pass" if verified_export and not pending_categories else "blocked"
         if number == 16 and verified_export:
             check_status = "pass"
+        if number == 15 and verified_export:
+            format_contracts = [
+                file_validation.get("format_contract", {}).get("status")
+                for file_validation in (verified_export.get("validation") or {}).get("files", [])
+            ]
+            check_status = "pass" if format_contracts and all(status == "passed" for status in format_contracts) else "failed"
         checklist.append({"number": number, "name": names[number], "status": check_status, "unresolved_categories": relevant, "evidence": evidence})
     applicable = [item for item in checklist if item["status"] != "not_applicable"]
     weights = {number: 2 if number in {1, 2, 16, 17} else 1 for number in range(1, 18)}
@@ -1294,10 +1634,11 @@ def ensure_finding_plan_is_current(connection: Any, finding: dict[str, Any]) -> 
 
 def apply_file_operations(item: dict[str, Any], source: Path, destination: Path, operations: list[dict[str, Any]]) -> dict[str, Any]:
     profile = item.get("profile") or {}
+    parsing = profile.get("parsing_config") or {}
     if item["format"] in {"csv", "tsv"}:
-        return apply_operations(source, destination, operations)
+        return apply_operations(source, destination, operations, parsing)
     if item["format"] == "xlsx":
-        return apply_xlsx_operations(source, destination, operations, profile.get("table_name", Path(item["filename"]).stem))
+        return apply_xlsx_operations(source, destination, operations, profile.get("table_name", Path(item["filename"]).stem), int(parsing.get("header_row") or 1))
     return apply_statistical_operations(source, destination, operations, item["format"])
 
 
@@ -1362,23 +1703,40 @@ def create_reviewed_version(connection: Any, project_id: str, file_id: str) -> d
     version_number = connection.execute("SELECT COALESCE(MAX(version_number), 0) + 1 FROM reviewed_versions WHERE file_id = ?", (file_id,)).fetchone()[0]
     destination = project_root(project_id) / "reviewed" / file_id / f"v{version_number}" / item["filename"]
     partial = destination.with_name(f"{destination.stem}.building{destination.suffix}")
-    output = apply_file_operations(item, Path(item["original_path"]), partial, operations)
-    validation_profile = profile_dataset(partial, item["filename"])
+    source_path = Path(item["original_path"])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    partial.replace(destination)
-    row_map_path = destination.parent / "row-map.json"
-    output_row_ids = reviewed_row_ids(file_id, original_shape(item)[0], operations)
-    if len(output_row_ids) != validation_profile["row_count"]:
-        raise ValueError("Reviewed output row lineage does not match the rebuilt dataset")
-    write_row_map(row_map_path, output_row_ids)
+    try:
+        output = apply_file_operations(item, source_path, partial, operations)
+        validation_profile = profile_dataset(partial, item["filename"])
+        change_validation = validate_operation_result(item, source_path, partial, operations)
+        format_validation = validate_format_contract(item, source_path, partial, operations)
+        output_row_ids = reviewed_row_ids(file_id, original_shape(item)[0], operations)
+        if len(output_row_ids) != validation_profile["row_count"]:
+            raise ValueError("Reviewed output row lineage does not match the rebuilt dataset")
+        partial.replace(destination)
+        row_map_path = destination.parent / "row-map.json"
+        write_row_map(row_map_path, output_row_ids)
+    except Exception:
+        if partial.exists():
+            partial.unlink()
+        raise
     plan_hash = hashlib.sha256("\n".join(operation_hash(operation) for operation in operations).encode("utf-8")).hexdigest()
-    validation = {"status": "passed", "rows": validation_profile["row_count"], "columns": validation_profile["column_count"], "source_hash_valid": hashlib.sha256(Path(item["original_path"]).read_bytes()).hexdigest() == item["sha256"]}
+    validation = {"status": "passed", "rows": validation_profile["row_count"], "columns": validation_profile["column_count"], "source_hash_valid": hashlib.sha256(source_path.read_bytes()).hexdigest() == item["sha256"], "change_validation": change_validation, "format_contract": format_validation}
     version = {"id": new_id("ver"), "project_id": project_id, "file_id": file_id, "version_number": version_number, "path": str(destination), "sha256": output["sha256"], "transformation_count": len(operations), "status": "ready", "created_at": now(), "plan_hash": plan_hash, "validation_json": json_dump(validation), "row_map_path": str(row_map_path)}
-    connection.execute("""INSERT INTO reviewed_versions(id, project_id, file_id, version_number, path, sha256,
-        transformation_count, status, created_at, plan_hash, validation_json, row_map_path)
-        VALUES (:id, :project_id, :file_id, :version_number, :path, :sha256, :transformation_count,
-        :status, :created_at, :plan_hash, :validation_json, :row_map_path)""", version)
-    audit(connection, project_id, "reviewed_version_created", {"file_id": file_id, "version": version_number, "transformations": len(operations), "sha256": output["sha256"]})
+    try:
+        connection.execute("""INSERT INTO reviewed_versions(id, project_id, file_id, version_number, path, sha256,
+            transformation_count, status, created_at, plan_hash, validation_json, row_map_path)
+            VALUES (:id, :project_id, :file_id, :version_number, :path, :sha256, :transformation_count,
+            :status, :created_at, :plan_hash, :validation_json, :row_map_path)""", version)
+        audit(connection, project_id, "reviewed_version_created", {"file_id": file_id, "version": version_number, "transformations": len(operations), "sha256": output["sha256"]})
+    except Exception:
+        destination.unlink(missing_ok=True)
+        row_map_path.unlink(missing_ok=True)
+        try:
+            destination.parent.rmdir()
+        except OSError:
+            pass
+        raise
     return version
 
 
@@ -1446,7 +1804,14 @@ def ruleset_hash(connection: Any, file_id: str) -> str:
         "SELECT signature FROM validation_rules WHERE file_id = ? AND status = 'confirmed' ORDER BY signature",
         (file_id,),
     ).fetchall()
-    return hashlib.sha256("\n".join((row[0] or "") for row in rows).encode("utf-8")).hexdigest()
+    study_row = connection.execute(
+        "SELECT sc.config_hash FROM study_configs sc JOIN files f ON f.project_id = sc.project_id WHERE f.id = ?",
+        (file_id,),
+    ).fetchone()
+    signatures = [row[0] or "" for row in rows]
+    if study_row:
+        signatures.append(f"study:{study_row[0]}")
+    return hashlib.sha256("\n".join(signatures).encode("utf-8")).hexdigest()
 
 
 def create_scan_record(
@@ -1483,6 +1848,7 @@ def persist_check_results(connection: Any, project_id: str, file_id: str, scan_i
     original_hash_valid = hashlib.sha256(Path(file_format_row["original_path"]).read_bytes()).hexdigest() == file_format_row["sha256"]
     rule_types = {row[0] for row in connection.execute("SELECT rule_type FROM validation_rules WHERE file_id = ? AND status = 'confirmed'", (file_id,)).fetchall()}
     project_file_count = connection.execute("SELECT COUNT(*) FROM files WHERE project_id = ?", (project_id,)).fetchone()[0]
+    runtime_status = r_status()
 
     def status_for(relevant: set[str], *, applicable: bool = True, blocked: bool = False) -> str:
         if not applicable:
@@ -1495,19 +1861,19 @@ def persist_check_results(connection: Any, project_id: str, file_id: str, scan_i
         (1, "file_integrity", "File integrity", status_for({"corrupted_row"}), {"encoding": profile.get("encoding"), "delimiter": profile.get("delimiter"), "warnings": profile.get("warnings", []), "source_hash_valid": original_hash_valid}),
         (2, "column_structure", "Column structure", status_for({"duplicate_column_name", "duplicate_column", "empty_column"}), {"columns": profile.get("column_count"), "schema": [item.get("name") for item in columns]}),
         (3, "missing_data", "Missing data", status_for({"missing_value", "missing_code_normalization"}), {"missing_by_column": {item["name"]: item.get("missing_count", 0) for item in columns}}),
-        (4, "duplicate_detection", "Duplicate detection", status_for({"duplicate_id", "duplicate_row", "near_duplicate", "potential_duplicate", "identity_not_verifiable"}), {"candidate_id_columns": profile.get("candidate_id_columns", [])}),
+        (4, "duplicate_detection", "Duplicate detection", status_for({"duplicate_id", "duplicate_row", "near_duplicate", "potential_duplicate", "identity_not_verifiable", "survey_duplicate_submission"}), {"candidate_id_columns": profile.get("candidate_id_columns", [])}),
         (5, "data_types", "Data types", status_for({"invalid_type"}), {"inferred_types": {item["name"]: item.get("inferred_type") for item in columns}}),
         (6, "text_standardization", "Text standardization", status_for({"whitespace", "text_normalization"}), {}),
         (7, "categorical_values", "Categorical values", status_for({"inconsistent_category", "codebook_inference"}), {}),
         (8, "numeric_validation", "Numeric validation", status_for({"invalid_type", "impossible_value", "outlier", "rule_range", "arithmetic_inference", "arithmetic_inconsistency", "arithmetic_relationship_unverified"}), {}),
         (9, "date_validation", "Date validation", status_for({"date_standardization", "ambiguous_date"}), {}),
-        (10, "rating_scales", "Rating scales", status_for({"invalid_scale"}, applicable=any(SCALE_PATTERN.search(item.get("name", "")) for item in columns) or "scale" in rule_types), {}),
-        (11, "cross_column", "Cross-column validation", status_for({"rule_cross_column", "arithmetic_inference", "arithmetic_inconsistency", "arithmetic_relationship_unverified"}, applicable="cross_column" in rule_types or bool(profile.get("verified_relationships"))), {"verified_relationships": profile.get("verified_relationships", [])}),
+        (10, "rating_scales", "Rating scales", status_for({"invalid_scale", "survey_invalid_scale"}, applicable=any(SCALE_PATTERN.search(item.get("name", "")) for item in columns) or "scale" in rule_types or "survey_invalid_scale" in categories), {}),
+        (11, "cross_column", "Cross-column validation", status_for({"rule_cross_column", "arithmetic_inference", "arithmetic_inconsistency", "arithmetic_relationship_unverified", "survey_skip_logic", "survey_cross_field"}, applicable="cross_column" in rule_types or bool(profile.get("verified_relationships")) or bool(categories & {"survey_skip_logic", "survey_cross_field"})), {"verified_relationships": profile.get("verified_relationships", [])}),
         (12, "cross_file", "Cross-file validation", status_for({"cross_file"}, applicable=project_file_count > 1), {"project_file_count": project_file_count}),
-        (13, "statistical_quality", "Statistical quality", status_for({"constant_column", "outlier", "suspicious_pattern"}), {}),
-        (14, "formatting_consistency", "Formatting consistency", status_for({"whitespace", "text_normalization", "corrupted_row"}), {"encoding": profile.get("encoding"), "delimiter": profile.get("delimiter")}),
+        (13, "statistical_quality", "Statistical quality", status_for({"constant_column", "outlier", "suspicious_pattern", "survey_incomplete", "survey_straightlining", "survey_attention_check", "survey_speeder"}), {"survey_checks": "configured" if connection.execute("SELECT 1 FROM study_configs WHERE project_id = ? AND status = 'confirmed'", (project_id,)).fetchone() else "not_configured"}),
+        (14, "formatting_consistency", "Formatting consistency", status_for({"whitespace", "text_normalization", "corrupted_row", "spreadsheet_formula", "broken_text_encoding"}), {"encoding": profile.get("encoding"), "delimiter": profile.get("delimiter")}),
         (15, "metadata_preservation", "Metadata preservation", "not_applicable" if file_format in {"csv", "tsv"} else "blocked", {"format": file_format, "metadata": profile.get("format_metadata", {})}),
-        (16, "safety_reproducibility", "Safety & reproducibility", "failed" if not original_hash_valid else ("pass" if shutil.which("Rscript") else "attention"), {"source_hash_valid": original_hash_valid, "r_runtime_available": bool(shutil.which("Rscript"))}),
+        (16, "safety_reproducibility", "Safety & reproducibility", "failed" if not original_hash_valid else ("pass" if runtime_status["ready"] else "attention"), {"source_hash_valid": original_hash_valid, "r_runtime_available": runtime_status["available"], "r_runtime_ready": runtime_status["ready"], "r_runtime_message": runtime_status["message"]}),
         (17, "final_validation", "Final validation", "blocked", {"reason": "A verified export has not passed all validation gates."}),
     ]
     timestamp = now()

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "basic_survey",
+    "content": "participant_id,status,occupation\n001,Active, Teacher \n002,active,Nurse\n",
+    "expected_categories": ["whitespace", "inconsistent_category"],
+    "forbidden_operations": ["delete_rows"]
+  },
+  {
+    "name": "numeric_category_preservation",
+    "content": "participant_id,age,group\n001,30,1\n002,forty,2\n003,41,1\n",
+    "expected_categories": ["invalid_type"],
+    "forbidden_operations": ["delete_rows"]
+  },
+  {
+    "name": "dates_and_missing",
+    "content": "participant_id,visit_date,score\n001,2026/01/03,5\n002,03/04/2026,N/A\n003,13/04/2026,4\n",
+    "expected_categories": ["date_standardization", "ambiguous_date", "missing_value"],
+    "forbidden_operations": ["delete_rows"]
+  },
+  {
+    "name": "duplicate_review",
+    "content": "participant_id,visit,value\n001,A,1\n001,A,1\n002,A,1\n",
+    "expected_categories": ["duplicate_id", "duplicate_row"],
+    "forbidden_operations": []
+  },
+  {
+    "name": "unicode_khmer",
+    "content": "participant_id,province,comment\n001,ភ្នំពេញ,សុខសប្បាយ\n002,ភ្នំពេញ, អត្ថបទ \n",
+    "expected_categories": ["whitespace"],
+    "forbidden_operations": ["delete_rows", "parse_type"]
+  },
+  {
+    "name": "valid_extreme_values",
+    "content": "participant_id,temperature,comment\n001,-20,valid cold reading\n002,99,valid reading\n003,1000,calibrated extreme\n",
+    "expected_categories": [],
+    "forbidden_operations": ["delete_rows", "replace", "parse_type", "normalize_missing"]
+  }
+]
