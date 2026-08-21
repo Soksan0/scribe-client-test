@@ -69,7 +69,7 @@ export function ScribeClient() {
   const [filePreview, setFilePreview] = useState<Json | null>(null);
   const [activeFinding, setActiveFinding] = useState<string | null>(null);
   const [findingPreview, setFindingPreview] = useState<Json | null>(null);
-  const [detailsOpen, setDetailsOpen] = useState(true);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [reviewBusy, setReviewBusy] = useState(false);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [showReadinessHelp, setShowReadinessHelp] = useState(false);
@@ -513,23 +513,23 @@ function reviewOnlyGuidance(finding: Json) {
 function ReviewOnlyPanel({ active, rationale, setRationale, disposition, busy }: any) {
   const guidance = reviewOnlyGuidance(active);
   const actions = [
-    { value: "acknowledged", title: "Acknowledge limitation", body: "The issue is real, but the safest cleaning strategy is to preserve the value and document how analysis should handle it.", rationale: guidance.acknowledge, primary: true },
-    { value: "false_positive", title: "Mark false positive", body: "The flagged value is valid for this study or the detector misunderstood the context.", rationale: guidance.falsePositive },
-    { value: "deferred", title: "Defer decision", body: "The finding needs a codebook, PI, instrument, or analysis-plan decision before it can be closed.", rationale: guidance.defer },
+    { value: "acknowledged", title: "Keep and document", body: "Real issue; no safe edit.", rationale: guidance.acknowledge, primary: true },
+    { value: "false_positive", title: "Valid value", body: "This flag is incorrect.", rationale: guidance.falsePositive },
+    { value: "deferred", title: "Decide later", body: "More context is needed.", rationale: guidance.defer },
   ];
-  return <div className="review-only-panel"><div className="review-only-heading"><span>Needs confirmation</span><h3>{guidance.problem}</h3><p>{guidance.risk}</p></div><div className="strategy-card"><strong>Recommended cleaning strategies</strong><ul>{guidance.strategies.map((strategy: string) => <li key={strategy}>{strategy}</li>)}</ul></div><label className="rationale-field">Decision note<textarea value={rationale} onChange={(event) => setRationale(event.target.value)} placeholder="Optional: replace the suggested note with study-specific evidence." /></label><div className="review-actions">{actions.map((action) => <button key={action.value} type="button" className={action.primary ? "primary-button review-action" : "review-action"} disabled={busy} onClick={() => disposition(action.value, rationale.trim() || action.rationale)}><strong>{action.title}</strong><span>{action.body}</span><small>Save this review decision</small></button>)}</div></div>;
+  return <div className="review-only-panel"><div className="review-only-heading"><span>Needs your decision</span><h3>{guidance.problem}</h3><p>{guidance.risk}</p></div><details className="strategy-card"><summary>View suggested cleaning options</summary><ul>{guidance.strategies.map((strategy: string) => <li key={strategy}>{strategy}</li>)}</ul></details><label className="rationale-field">Optional note<input value={rationale} onChange={(event) => setRationale(event.target.value)} placeholder="Add study-specific context" /></label><div className="review-actions">{actions.map((action) => <button key={action.value} type="button" className={action.primary ? "primary-button review-action" : "review-action"} disabled={busy} title={action.rationale} onClick={() => disposition(action.value, rationale.trim() || action.rationale)}><strong>{action.title}</strong><span>{action.body}</span></button>)}</div></div>;
 }
 
 function ManualOperationPanel({ active, submit, busy }: any) {
   const [open, setOpen] = useState(false);
   const [kind, setKind] = useState<"cell_correction" | "exclude_row" | "exclude_column">("cell_correction");
   const [value, setValue] = useState("");
-  const [evidence, setEvidence] = useState("");
-  const [rationale, setRationale] = useState("");
-  useEffect(() => { setOpen(false); setKind("cell_correction"); setValue(""); setEvidence(""); setRationale(""); }, [active?.id]);
+  const [note, setNote] = useState("");
+  useEffect(() => { setOpen(false); setKind("cell_correction"); setValue(""); setNote(""); }, [active?.id]);
   if (!active?.row_id && !active?.column_name) return null;
-  const canSubmit = evidence.trim().length >= 3 && rationale.trim().length >= 3 && (kind !== "cell_correction" || value !== "");
-  return <div className="manual-operation"><button type="button" onClick={() => setOpen((current) => !current)}>{open ? "Cancel evidence-backed operation" : "Use source evidence to correct or exclude"}</button>{open && <div className="manual-operation-form"><label>Operation<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="cell_correction" disabled={!active.row_id || !active.column_name}>Correct this cell</option><option value="exclude_row" disabled={!active.row_id}>Exclude this row</option><option value="exclude_column" disabled={!active.column_name}>Exclude this column</option></select></label>{kind === "cell_correction" && <label>Confirmed replacement<input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Enter the value shown in the source record" /></label>}<label>Evidence<textarea value={evidence} onChange={(event) => setEvidence(event.target.value)} placeholder="Example: Codebook version 2 defines -9 as missing." /></label><label>Analysis rationale<textarea value={rationale} onChange={(event) => setRationale(event.target.value)} placeholder="Explain why this change or exclusion is justified." /></label><button className="primary-button" disabled={busy || !canSubmit} onClick={() => submit({ kind, row_id: active.row_id, column: active.column_name, before: active.before, after: kind === "cell_correction" ? value : null, evidence, rationale })}>{kind === "cell_correction" ? "Apply documented correction" : kind === "exclude_row" ? "Exclude documented row" : "Exclude documented column"}</button><small>This creates a separate audited operation with exact preconditions. It never edits the original upload.</small></div>}</div>;
+  const canSubmit = note.trim().length >= 3 && (kind !== "cell_correction" || value !== "");
+  const actionLabel = kind === "cell_correction" ? "Apply correction" : kind === "exclude_row" ? "Exclude row" : "Exclude column";
+  return <div className="manual-operation"><button type="button" onClick={() => setOpen((current) => !current)}>{open ? "Cancel manual change" : "Make a documented change"}</button>{open && <div className="manual-operation-form"><div className="manual-context"><span>Selected evidence</span><strong>{active.column_name || "Entire row"} · row {active.row_number || "—"}</strong><code>{JSON.stringify(active.before)}</code></div><label>Change<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="cell_correction" disabled={!active.row_id || !active.column_name}>Replace this value</option><option value="exclude_row" disabled={!active.row_id}>Exclude this row</option><option value="exclude_column" disabled={!active.column_name}>Exclude this column</option></select></label>{kind === "cell_correction" && <label>New value<input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Enter the confirmed replacement" /></label>}<label>Why is this change justified?<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Example: Source form for P001 records age 31." /></label><div className="manual-submit"><button className="primary-button" disabled={busy || !canSubmit} onClick={() => submit({ kind, row_id: active.row_id, column: active.column_name, before: active.before, after: kind === "cell_correction" ? value : null, evidence: note, rationale: note })}>{busy ? "Applying…" : actionLabel}</button><small>Reviewed copy only · audited · reversible</small></div></div>}</div>;
 }
 
 function IssuesView({ findings, total, page, setPage, status, setStatus, active, preview, select, decide, disposition, manualOperation, undo, detailsOpen, closeDetails, openDetails, busy }: any) {

@@ -47,16 +47,16 @@ try {
 
   await page.locator('a[href$="/issues"]').first().click();
   const reviewActions = [
-    { name: /Acknowledge limitation/, notice: "Limitation acknowledged with your rationale." },
-    { name: /Mark false positive/, notice: "Finding marked as a false positive." },
-    { name: /Defer decision/, notice: "Finding deferred for later review." },
+    { name: /Keep and document/, notice: "Limitation acknowledged with your rationale." },
+    { name: /Valid value/, notice: "Finding marked as a false positive." },
+    { name: /Decide later/, notice: "Finding deferred for later review." },
   ];
   for (let index = 0; index < 7; index += 1) {
     const pendingItems = page.locator(".issue-list > button:has(.status-pill.pending)");
     const pendingFinding = pendingItems.first();
     await pendingFinding.waitFor();
     await pendingFinding.click();
-    await page.getByText("Recommended cleaning strategies").waitFor();
+    await page.getByText("View suggested cleaning options").waitFor();
     const action = reviewActions[index % reviewActions.length];
     await page.getByRole("button", { name: action.name }).click();
     await page.getByText(action.notice).waitFor();

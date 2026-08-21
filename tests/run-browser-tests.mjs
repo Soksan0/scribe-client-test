@@ -1,12 +1,19 @@
 import { spawn } from "node:child_process";
-import { access, mkdtemp } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, symlink } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const dataRoot = await mkdtemp(path.join(os.tmpdir(), "scribe-release-"));
+const frontendRoot = path.join(dataRoot, "frontend");
 const python = path.join(root, ".venv", "bin", "python");
+
+await mkdir(frontendRoot, { recursive: true });
+for (const entry of ["app", "public", "package.json", "next.config.ts", "postcss.config.mjs", "tsconfig.json", "vite.config.ts"]) {
+  await cp(path.join(root, entry), path.join(frontendRoot, entry), { recursive: true });
+}
+await symlink(path.join(root, "node_modules"), path.join(frontendRoot, "node_modules"), process.platform === "win32" ? "junction" : "dir");
 
 async function availablePort() {
   return await new Promise((resolve, reject) => {
@@ -41,13 +48,14 @@ backend.stderr.on("data", (chunk) => backendOutput.push(chunk.toString()));
 let frontend;
 try {
   await waitFor(`http://127.0.0.1:${apiPort}/api/health`, backend, backendOutput);
-  frontend = spawn("npm", ["run", "dev", "--", "--host", "127.0.0.1", "--port", String(uiPort), "--strictPort"], { cwd: root, env: { ...commonEnv, SCRIBE_API_PROXY_TARGET: `http://127.0.0.1:${apiPort}` } });
+  frontend = spawn("npm", ["run", "dev", "--", "--host", "127.0.0.1", "--port", String(uiPort), "--strictPort"], { cwd: frontendRoot, env: { ...commonEnv, SCRIBE_API_PROXY_TARGET: `http://127.0.0.1:${apiPort}` } });
   frontend.stdout.on("data", (chunk) => frontendOutput.push(chunk.toString()));
   frontend.stderr.on("data", (chunk) => frontendOutput.push(chunk.toString()));
   await waitFor(`http://localhost:${uiPort}`, frontend, frontendOutput);
   process.env.SCRIBE_UI_URL = `http://localhost:${uiPort}`;
   process.env.SCRIBE_DOWNLOAD_DIR = path.join(dataRoot, "downloads");
   await import(`./browser-journey.mjs?run=${Date.now()}`);
+  await import(`./manual-ui-browser-journey.mjs?run=${Date.now()}`);
   const cafeFixture = process.env.SCRIBE_CAFE_FIXTURE || "/Users/soksanhay/Downloads/dirty_cafe_sales.csv";
   try {
     await access(cafeFixture);

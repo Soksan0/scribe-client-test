@@ -1118,6 +1118,8 @@ def create_manual_operation(project_id: str, payload: ManualOperationCreate) -> 
             source_finding = finding_record(connection, project_id, payload.source_finding_id) if payload.source_finding_id else None
             if source_finding and (source_finding["file_id"] != item["id"] or source_finding["status"] != "pending"):
                 raise HTTPException(409, "The source finding is no longer pending for this dataset")
+            if source_finding:
+                ensure_finding_plan_is_current(connection, source_finding)
             finding_id = insert_finding(
                 connection, project_id, item["id"], None, "manual_operation", "high", "user_confirmed",
                 title, f"Researcher supplied evidence: {payload.evidence}", table_name, payload.column,

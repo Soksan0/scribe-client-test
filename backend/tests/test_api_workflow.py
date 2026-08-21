@@ -137,6 +137,57 @@ class ApiWorkflowTests(unittest.TestCase):
         restored = self.client.get(f"/api/projects/{project_id}/files/{uploaded['id']}/preview?version=reviewed").json()
         self.assertIn("occupation", restored["columns"])
 
+    def test_manual_row_exclusion_uses_stable_identity_and_stale_findings_are_rejected(self) -> None:
+        project_id = self.create_project()
+        uploaded = self.client.post(
+            f"/api/projects/{project_id}/files?filename=manual.csv",
+            content=b"participant_id,age\nP001,nan\nP002,40\nP003,41\n",
+            headers={"content-type": "text/csv"},
+        ).json()
+        findings = self.client.get(f"/api/projects/{project_id}/findings?limit=500").json()["items"]
+        missing = next(item for item in findings if item["category"] == "missing_value" and item.get("row_id"))
+        excluded = self.client.post(
+            f"/api/projects/{project_id}/manual-operations",
+            json={
+                "file_id": uploaded["id"],
+                "source_finding_id": missing["id"],
+                "kind": "exclude_row",
+                "row_id": missing["row_id"],
+                "rationale": "Consent withdrawal recorded in the participant log",
+                "evidence": "Participant P001 withdrew and requested record exclusion",
+            },
+        )
+        self.assertEqual(excluded.status_code, 201, excluded.text)
+        reviewed = self.client.get(f"/api/projects/{project_id}/files/{uploaded['id']}/preview?version=reviewed").json()
+        self.assertEqual([row["values"]["participant_id"] for row in reviewed["rows"]], ["P002", "P003"])
+        source = self.client.get(f"/api/projects/{project_id}/findings?limit=500").json()["items"]
+        self.assertEqual(next(item for item in source if item["id"] == missing["id"])["disposition"], "resolved_by_manual_operation")
+
+        undone = self.client.post(f"/api/projects/{project_id}/findings/{excluded.json()['finding_id']}/undo")
+        self.assertEqual(undone.status_code, 200, undone.text)
+        restored = self.client.get(f"/api/projects/{project_id}/files/{uploaded['id']}/preview?version=reviewed").json()
+        self.assertEqual([row["values"]["participant_id"] for row in restored["rows"]], ["P001", "P002", "P003"])
+
+        current_missing = next(
+            item for item in self.client.get(f"/api/projects/{project_id}/findings?limit=500").json()["items"]
+            if item["id"] == missing["id"]
+        )
+        accepted = self.client.post(
+            f"/api/projects/{project_id}/findings/{next(item['id'] for item in findings if item.get('operation') and item.get('row_id'))}/decision",
+            json={"decision": "accepted"},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        stale = self.client.post(
+            f"/api/projects/{project_id}/manual-operations",
+            json={
+                "file_id": uploaded["id"], "source_finding_id": current_missing["id"],
+                "kind": "cell_correction", "row_id": current_missing["row_id"],
+                "column": "age", "before": "nan", "after": "39",
+                "rationale": "Late source form", "evidence": "Source form records 39",
+            },
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+
     def test_parsing_confirmation_handles_metadata_rows_and_builds_canonical_snapshot(self) -> None:
         project_id = self.create_project()
         uploaded = self.client.post(
