@@ -16,7 +16,7 @@ Windows easiest option:
 1. Install Python 3.11+ and Node.js 22+.
 2. Download or clone the repo.
 3. Double-click `Start-Scribe-Windows.bat`.
-4. Open `http://localhost:3000`, or the local address printed in the terminal.
+4. Open the local address printed in the terminal, normally `http://localhost:3000`.
 
 For more detail, see `WINDOWS_CLIENT_GUIDE.md`.
 
@@ -38,7 +38,7 @@ npm ci
 .venv\Scripts\python scripts\start_scribe.py
 ```
 
-The launcher prints and opens the local address, usually `http://localhost:3000`.
+The launcher prints and opens the local address, usually `http://localhost:3000`. Keep that terminal window open while using Scribe.
 
 ## GitHub handoff option
 

@@ -5,10 +5,8 @@ import test from "node:test";
 async function render(path = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-  return worker.fetch(new Request(`http://localhost${path}`, { headers: { accept: "text/html" } }), {
-    ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
-  }, { waitUntil() {}, passThroughOnException() {} });
+  const { default: handleRequest } = await import(workerUrl.href);
+  return handleRequest(new Request(`http://127.0.0.1${path}`, { headers: { accept: "text/html" } }));
 }
 
 test("server-renders Scribe on root and refreshable project routes", async () => {
@@ -24,9 +22,10 @@ test("server-renders Scribe on root and refreshable project routes", async () =>
 });
 
 test("visible controls are connected and demo data is absent", async () => {
-  const [client, main] = await Promise.all([
+  const [client, main, uploadValidation] = await Promise.all([
     readFile(new URL("../app/ScribeClient.tsx", import.meta.url), "utf8"),
     readFile(new URL("../backend/app/main.py", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/dataset-upload.ts", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(client, /DEMO_FINDINGS|PREVIEW_ROWS|demo fallback/i);
   assert.doesNotMatch(main, /DEMO_FINDINGS|PREVIEW_ROWS/);
@@ -37,4 +36,7 @@ test("visible controls are connected and demo data is absent", async () => {
   for (const section of ["overview", "files", "rules", "issues", "exports"]) assert.match(client, new RegExp(`\\b${section}\\b`));
   assert.match(client, /Scribe’s local service is unavailable/);
   assert.match(client, /No sample data has been substituted/);
+  assert.match(client, /Drop a dataset here/);
+  assert.match(uploadValidation, /is not supported\. Choose a/);
+  assert.match(client, /could not reach its local data service/);
 });

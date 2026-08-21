@@ -1,10 +1,11 @@
 "use client";
 /* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { DragEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { components } from "./lib/api-schema";
+import { DATASET_ACCEPT, validateDatasetFile } from "./lib/dataset-upload";
 
 const API = process.env.NEXT_PUBLIC_SCRIBE_API_URL || "";
 const sections = ["overview", "files", "rules", "issues", "exports", "settings"] as const;
@@ -14,7 +15,12 @@ type Json = Record<string, any>;
 type DecisionPayload = components["schemas"]["DecisionCreate"];
 
 async function api<T = any>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, options);
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, options);
+  } catch {
+    throw new Error("Scribe could not reach its local data service. Keep the Scribe starter window open, then click Retry. On Windows, allow Python and Node.js through the firewall if prompted.");
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.detail || `Request failed (${response.status})`);
@@ -63,6 +69,7 @@ export function ScribeClient() {
   const [findingPreview, setFindingPreview] = useState<Json | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(true);
   const [reviewBusy, setReviewBusy] = useState(false);
+  const [uploadBusy, setUploadBusy] = useState(false);
   const [showReadinessHelp, setShowReadinessHelp] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -129,16 +136,18 @@ export function ScribeClient() {
   const pending = project.pending_count;
   const active = findings.find((item) => item.id === activeFinding) || null;
 
-  async function upload(event: ChangeEvent<HTMLInputElement>) {
-    const selected = event.target.files?.[0];
+  async function upload(selected?: File) {
     if (!selected) return;
+    const validationError = validateDatasetFile(selected);
+    if (validationError) { setNotice(""); setError(validationError); return; }
+    setUploadBusy(true);
     setNotice(`Profiling ${selected.name}…`); setError("");
     try {
       const result = await api(`/api/projects/${route.projectId}/files?filename=${encodeURIComponent(selected.name)}`, { method: "POST", headers: { "content-type": selected.type || "application/octet-stream" }, body: selected });
       setNotice(`${selected.name}: ${result.row_count.toLocaleString()} rows, ${result.column_count} columns, ${result.finding_count} findings.`);
       await load(); setActiveFile(result.id);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Upload failed"); }
-    event.target.value = "";
+    } catch (reason) { setNotice(""); setError(reason instanceof Error ? reason.message : "Upload failed"); }
+    finally { setUploadBusy(false); if (fileInput.current) fileInput.current.value = ""; }
   }
 
   async function decide(decision: "accepted" | "rejected", editedValue?: string, duplicateSelection?: { retained_row_id: string; removed_row_ids: string[] }) {
@@ -206,14 +215,14 @@ export function ScribeClient() {
       <section className="workspace">
         <header className="project-header">
           <div><h1>{project.name}</h1><p>Dataset QA · {project.file_count} files · {project.pending_count} pending findings</p></div>
-          <div className="header-actions"><button className="secondary-button" onClick={() => fileInput.current?.click()}>Add dataset</button><input ref={fileInput} type="file" accept=".csv,.tsv,.xlsx,.sav,.dta,.rds" hidden onChange={upload}/><div className="local-badge"><span>◇</span><strong>Local by default</strong><small>Gemini is opt-in</small></div></div>
+          <div className="header-actions"><button className="secondary-button" disabled={uploadBusy} onClick={() => fileInput.current?.click()}>{uploadBusy ? "Uploading…" : "Add dataset"}</button><input ref={fileInput} type="file" accept={DATASET_ACCEPT} hidden onChange={(event) => void upload(event.target.files?.[0])}/><div className="local-badge"><span>◇</span><strong>Local by default</strong><small>Gemini is opt-in</small></div></div>
         </header>
         {(notice || error) && <div className={error ? "message error" : "message"} role="status">{error || notice}<button aria-label="Dismiss message" onClick={() => { setError(""); setNotice(""); }}>×</button></div>}
         {Boolean(project.needs_rescan) && <div className="migration-warning"><div><strong>Current-engine validation required</strong><p>Older corrections were preserved in the audit and quarantined. Run a fresh scan before trusting readiness or exports.</p></div><button onClick={reanalyze}>Run current scan</button></div>}
         <nav className="stepper" aria-label="Project progress">{workflowSections.map((item, index) => <Link key={item} href={`/projects/${route.projectId}/${item}`} className={route.section === item ? "current" : ""}><span>{index + 1}</span><strong>{item === "overview" ? "Overview" : item[0].toUpperCase() + item.slice(1)}</strong></Link>)}</nav>
 
         {route.section === "overview" && <><Overview project={project} onHelp={() => setShowReadinessHelp(true)} /><ChecklistPanel readiness={project.readiness} /></>}
-        {route.section === "files" && <FilesView files={files} preview={filePreview} activeFile={activeFile} selectFile={setActiveFile} upload={() => fileInput.current?.click()} previewVersion={previewVersion} setPreviewVersion={setPreviewVersion} scans={scans} />}
+        {route.section === "files" && <FilesView files={files} preview={filePreview} activeFile={activeFile} selectFile={setActiveFile} chooseFile={() => fileInput.current?.click()} upload={upload} uploadBusy={uploadBusy} previewVersion={previewVersion} setPreviewVersion={setPreviewVersion} scans={scans} />}
         {route.section === "rules" && <><RuleAutomation projectId={route.projectId} suggestions={suggestions} refresh={load} setNotice={setNotice} setError={setError} /><RulesView projectId={route.projectId} files={files} rules={rules} suggestions={suggestions} refresh={load} setNotice={setNotice} setError={setError} /><RuleMaintenance projectId={route.projectId} files={files} rules={rules} refresh={load} setNotice={setNotice} setError={setError} /><AdvancedRules projectId={route.projectId} files={files} relationships={relationships} refresh={load} setNotice={setNotice} setError={setError} /><GeminiAssistant projectId={route.projectId} files={files} refresh={load} setNotice={setNotice} setError={setError} /></>}
         {route.section === "issues" && <><BatchReview findings={findings} batchDecide={batchDecide} busy={reviewBusy} /><IssuesView findings={findings} total={findingTotal} page={findingPage} setPage={setFindingPage} status={findingStatus} setStatus={(value: string) => { setFindingStatus(value); setFindingPage(0); }} active={active} preview={findingPreview} select={setActiveFinding} decide={decide} disposition={disposition} undo={undo} detailsOpen={detailsOpen} closeDetails={() => setDetailsOpen(false)} openDetails={() => setDetailsOpen(true)} busy={reviewBusy} /></>}
         {route.section === "exports" && <ExportsView exports={exports} createExport={createExport} readiness={project.readiness} />}
@@ -266,10 +275,16 @@ function ChecklistPanel({ readiness }: { readiness: Json }) {
   return <section className="checklist-panel"><div className="checklist-heading"><div><p className="eyebrow">CLEAN DATA CHECKLIST</p><h2>{readiness.clean ? "All applicable checks cleared" : "Checks still require attention"}</h2></div><span className={readiness.clean ? "clean-label" : "review-label"}>{readiness.clean ? "Clean" : "Provisional"}</span></div><div className="checklist-grid">{checklist.map((item: Json) => <div key={item.number} className={item.status}><span>{item.status === "pass" ? "✓" : item.status === "attention" ? "!" : "—"}</span><div><strong>{item.number}. {item.name}</strong><small>{item.status === "attention" ? item.unresolved_categories.join(", ").replaceAll("_", " ") || "Needs confirmation" : item.status.replaceAll("_", " ")}</small></div></div>)}</div></section>;
 }
 
-function FilesView({ files, preview, activeFile, selectFile, upload, previewVersion, setPreviewVersion, scans }: any) {
+function FilesView({ files, preview, activeFile, selectFile, chooseFile, upload, uploadBusy, previewVersion, setPreviewVersion, scans }: any) {
+  const [dragging, setDragging] = useState(false);
   const active = files.find((file: Json) => file.id === activeFile);
   const scan = scans.find((item: Json) => item.file_id === activeFile);
-  return <section><div className="page-title"><div><p className="eyebrow">FILE INVENTORY</p><h2>Research datasets</h2><p>Original files remain unchanged. Compare the uploaded source with the current reviewed version.</p></div><button className="primary-button" onClick={upload}>Upload dataset</button></div>{files.length === 0 ? <Empty title="No datasets uploaded" body="Add CSV, TSV, XLSX, SAV, DTA, or RDS data to begin profiling." action="Choose a file" onAction={upload}/> : <><div className="two-column"><div className="file-list">{files.map((file: Json) => <button key={file.id} onClick={() => selectFile(file.id)} className={activeFile === file.id ? "selected" : ""}><strong>{file.filename}</strong><span>{file.format.toUpperCase()} · {formatBytes(file.size_bytes)} · {file.row_count.toLocaleString()} rows × {file.column_count} columns</span><small>{file.finding_count} findings · {file.reviewed_version ? `reviewed v${file.reviewed_version.version_number}` : "original only"}</small></button>)}</div><div><div className="version-switch" role="group" aria-label="Dataset version"><button className={previewVersion === "original" ? "active" : ""} onClick={() => setPreviewVersion("original")}>Original</button><button className={previewVersion === "reviewed" ? "active" : ""} onClick={() => setPreviewVersion("reviewed")} disabled={!active?.reviewed_version} title={!active?.reviewed_version ? "No accepted transformations yet" : "Show the rebuilt reviewed copy"}>Reviewed</button></div><DataTable preview={preview}/></div></div>{active && <div className="integrity-grid"><article><span>Original SHA-256</span><code title={active.sha256}>{active.sha256}</code><strong>Unchanged since upload</strong></article><article><span>Current scan</span><strong>{scan ? `${scan.engine_version} · ${scan.status}` : "No completed scan"}</strong><small>{scan?.finding_count ?? 0} evidence-backed findings</small></article><article><span>Schema fingerprint</span><code title={active.profile?.schema_fingerprint}>{active.profile?.schema_fingerprint || "Not recorded"}</code><small>{active.profile?.encoding || active.encoding} · delimiter {JSON.stringify(active.profile?.delimiter || active.delimiter)}</small></article></div>}</>}</section>;
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDragging(false);
+    if (!uploadBusy) void upload(event.dataTransfer.files?.[0]);
+  }
+  return <section><div className="page-title"><div><p className="eyebrow">FILE INVENTORY</p><h2>Research datasets</h2><p>Original files remain unchanged. Compare the uploaded source with the current reviewed version.</p></div><button className="primary-button" disabled={uploadBusy} onClick={chooseFile}>{uploadBusy ? "Uploading…" : "Upload dataset"}</button></div><div className={`upload-dropzone ${dragging ? "dragging" : ""} ${uploadBusy ? "busy" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={handleDrop}><strong>{uploadBusy ? "Reading and checking your dataset…" : "Drop a dataset here"}</strong><span>or <button type="button" disabled={uploadBusy} onClick={chooseFile}>choose a file</button> · CSV, TSV, XLSX, SAV, DTA, or RDS · up to 250 MB</span></div>{files.length === 0 ? <Empty title="No datasets uploaded" body="Drop a supported dataset above or choose a file to begin profiling."/> : <><div className="two-column"><div className="file-list">{files.map((file: Json) => <button key={file.id} onClick={() => selectFile(file.id)} className={activeFile === file.id ? "selected" : ""}><strong>{file.filename}</strong><span>{file.format.toUpperCase()} · {formatBytes(file.size_bytes)} · {file.row_count.toLocaleString()} rows × {file.column_count} columns</span><small>{file.finding_count} findings · {file.reviewed_version ? `reviewed v${file.reviewed_version.version_number}` : "original only"}</small></button>)}</div><div><div className="version-switch" role="group" aria-label="Dataset version"><button className={previewVersion === "original" ? "active" : ""} onClick={() => setPreviewVersion("original")}>Original</button><button className={previewVersion === "reviewed" ? "active" : ""} onClick={() => setPreviewVersion("reviewed")} disabled={!active?.reviewed_version} title={!active?.reviewed_version ? "No accepted transformations yet" : "Show the rebuilt reviewed copy"}>Reviewed</button></div><DataTable preview={preview}/></div></div>{active && <div className="integrity-grid"><article><span>Original SHA-256</span><code title={active.sha256}>{active.sha256}</code><strong>Unchanged since upload</strong></article><article><span>Current scan</span><strong>{scan ? `${scan.engine_version} · ${scan.status}` : "No completed scan"}</strong><small>{scan?.finding_count ?? 0} evidence-backed findings</small></article><article><span>Schema fingerprint</span><code title={active.profile?.schema_fingerprint}>{active.profile?.schema_fingerprint || "Not recorded"}</code><small>{active.profile?.encoding || active.encoding} · delimiter {JSON.stringify(active.profile?.delimiter || active.delimiter)}</small></article></div>}</>}</section>;
 }
 
 function RuleAutomation({ projectId, suggestions, refresh, setNotice, setError }: any) {

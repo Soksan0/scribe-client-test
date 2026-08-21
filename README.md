@@ -57,7 +57,7 @@ The shortest path is:
 4. Double-click `Start-Scribe-Windows.bat`.
 5. Open the local address printed by the starter, usually `http://localhost:3000`.
 
-Scribe runs on your own computer. Uploaded datasets stay local in `.scribe_data/`, which is ignored by Git.
+Keep the starter window open while testing. Upload by choosing a supported file or dragging it onto the Files screen. Scribe runs on your own computer, and uploaded datasets stay local in `.scribe_data/`, which is ignored by Git.
 
 ### macOS
 

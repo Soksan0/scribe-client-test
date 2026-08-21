@@ -43,6 +43,33 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         return response.json(), content
 
+    def test_upload_rejects_unsupported_empty_and_unreadable_files(self) -> None:
+        project_id = self.create_project()
+        unsupported = self.client.post(
+            f"/api/projects/{project_id}/files?filename=notes.pdf",
+            content=b"not a dataset",
+            headers={"content-type": "application/pdf"},
+        )
+        self.assertEqual(unsupported.status_code, 415, unsupported.text)
+        self.assertIn("CSV, TSV, XLSX, SAV, DTA, and RDS", unsupported.json()["detail"])
+
+        empty = self.client.post(
+            f"/api/projects/{project_id}/files?filename=empty.csv",
+            content=b"",
+            headers={"content-type": "text/csv"},
+        )
+        self.assertEqual(empty.status_code, 400, empty.text)
+        self.assertIn("empty", empty.json()["detail"].lower())
+
+        unreadable = self.client.post(
+            f"/api/projects/{project_id}/files?filename=broken.xlsx",
+            content=b"this is not an Excel workbook",
+            headers={"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        )
+        self.assertEqual(unreadable.status_code, 422, unreadable.text)
+        self.assertIn("could not read", unreadable.json()["detail"].lower())
+        self.assertEqual(self.client.get(f"/api/projects/{project_id}/files").json(), [])
+
     def test_project_upload_preview_decision_undo_and_export(self) -> None:
         project_id = self.create_project()
         uploaded, original = self.upload_seed(project_id)

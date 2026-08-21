@@ -146,7 +146,7 @@ def main() -> int:
         environment.pop("NEXT_PUBLIC_SCRIBE_API_URL", None)
         environment["SCRIBE_API_PROXY_TARGET"] = f"http://127.0.0.1:{api_port}"
         frontend = subprocess.Popen(
-            [npm, "exec", "vinext", "--", "dev", "--host", "127.0.0.1", "--port", str(ui_port), "--strictPort"],
+            [npm, "run", "dev", "--", "--host", "127.0.0.1", "--port", str(ui_port), "--strictPort"],
             cwd=ROOT,
             env=environment,
         )

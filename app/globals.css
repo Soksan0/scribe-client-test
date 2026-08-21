@@ -2,6 +2,11 @@
 
 :root { --ink:#10223f; --muted:#657080; --line:#ddd9cf; --canvas:#f7f6f2; --paper:#fffefa; --green:#32633e; --green-soft:#edf5eb; --amber:#b9680d; --amber-soft:#fff7e8; --red:#c84d48; --blue:#2368b2; }
 * { box-sizing:border-box; }
+.upload-dropzone { display:grid; place-items:center; gap:7px; margin:0 0 16px; padding:25px; border:2px dashed #aeb9aa; border-radius:10px; background:#fbfdf9; color:#385943; text-align:center; transition:border-color .15s,background .15s; }
+.upload-dropzone.dragging { border-color:var(--green); background:var(--green-soft); }
+.upload-dropzone.busy { opacity:.7; }
+.upload-dropzone span { color:var(--muted); font-size:11px; }
+.upload-dropzone button { padding:0; border:0; background:transparent; color:var(--green); font-weight:700; text-decoration:underline; }
 html,body { margin:0; min-height:100%; background:var(--canvas); color:var(--ink); }
 body,button,input,select,textarea { font-family:var(--font-geist-sans),Arial,sans-serif; }
 button,a { color:inherit; }

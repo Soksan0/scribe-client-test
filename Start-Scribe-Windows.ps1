@@ -22,19 +22,28 @@ function Assert-Command {
     }
 }
 
-Assert-Command -Name "py" -InstallUrl "https://www.python.org/downloads/"
 Assert-Command -Name "npm" -InstallUrl "https://nodejs.org/"
+
+$PythonLauncher = if (Get-Command "py" -ErrorAction SilentlyContinue) {
+    "py"
+} elseif (Get-Command "python" -ErrorAction SilentlyContinue) {
+    "python"
+} else {
+    Write-Host "Python is required but was not found." -ForegroundColor Red
+    Write-Host "Install it from https://www.python.org/downloads/ and select 'Add python.exe to PATH'."
+    exit 1
+}
 
 if (-not (Test-Path ".venv\Scripts\python.exe")) {
     Write-Host "Creating local Python environment..."
-    py -m venv .venv
+    & $PythonLauncher -m venv .venv
 }
 
 Write-Host "Installing Python packages..."
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
-if (-not (Test-Path "node_modules")) {
+if (-not (Test-Path "node_modules\.package-lock.json")) {
     Write-Host "Installing website packages..."
     npm ci
 }
@@ -44,4 +53,3 @@ Write-Host "Launching Scribe. Leave this window open while testing." -Foreground
 Write-Host ""
 
 .\.venv\Scripts\python.exe scripts\start_scribe.py
-

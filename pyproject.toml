@@ -20,7 +20,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["backend*"]
-exclude = ["app*", "db*", "drizzle*", "worker*", "node_modules*"]
+exclude = ["app*", "node_modules*"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "httpx>=0.28,<1"]

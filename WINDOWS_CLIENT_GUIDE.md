@@ -4,7 +4,7 @@ This guide is for testers who want to run Scribe on their own Windows computer.
 
 Scribe runs locally. That means:
 
-- your browser opens Scribe at `http://localhost:3000`;
+- your browser opens Scribe at a private loopback address, normally `http://localhost:3000`;
 - uploaded datasets stay on your computer;
 - GitHub is only used to download the app code;
 - datasets are not uploaded to GitHub unless you manually add them there.
@@ -68,6 +68,8 @@ http://localhost:3000
 
 If port `3000` is already busy, Scribe may choose another local address. Use the address printed in the terminal window.
 
+Leave the starter window open while using Scribe. Closing it stops the local data service, so uploads will no longer work.
+
 ## 5. Stop Scribe
 
 Go back to the terminal window and press:
@@ -81,7 +83,7 @@ Ctrl + C
 Please try this with a sample or copied dataset first:
 
 1. Create a project.
-2. Upload a CSV or Excel file.
+2. Upload a dataset by choosing a file or dragging it onto the Files screen. Scribe accepts CSV, TSV, XLSX, SAV, DTA, and RDS files up to 250 MB.
 3. Review the Issues page.
 4. Try accepting a safe correction.
 5. Try rejecting, deferring, or marking a finding as a false positive.
@@ -105,4 +107,3 @@ Please send:
 - what file type you uploaded, such as CSV or XLSX;
 - what you expected to happen;
 - what actually happened.
-
